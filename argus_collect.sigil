@@ -1,0 +1,409 @@
+module argus_collect
+  targets server
+  trust none
+
+use argus_observe.Line;
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.tx_commit;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.is_commit_unknown;
+use db.relation.ScanOrder;
+use db.relation.column;
+use db.relation.rel_create_index;
+use db.relation.rel_create_table;
+use db.relation.rel_insert;
+use db.relation.rel_scan;
+use db.relation.rel_table_exists;
+use db.types.Value;
+use db.types.compare_bytes;
+use db.types.encode_value;
+use db.types.tag_bytes;
+use db.types.tag_int;
+use db.types.tag_str;
+
+pub enum RecordKey {
+  Log(String),
+  Metric(Bytes, Bytes),
+}
+
+pub struct Record {
+  key: RecordKey,
+  ts: String,
+  component: Bytes,
+  data: Bytes,
+}
+
+pub struct Batch {
+  records: List<Record>,
+  size: Int,
+  limit: Int,
+  uncertain: Bool,
+}
+
+pub fn batch(max_bytes: Int) -> Result<Batch, DbError>
+  intent "Create a buffer with an explicit NDJSON byte limit."
+  requires none
+  ensures none
+  effects none
+{
+  if max_bytes <= 0 {
+    return Err(DbError.Limit("batch byte limit must be positive"));
+  }
+  return Ok(Batch { records: List.new(), size: 0, limit: max_bytes, uncertain: false });
+}
+
+fn field(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Option<JsonNode>
+  intent "Locate one named field in the emitter's flat JSON representation."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(item) => {
+        if item.name() == name {
+          return match nodes.get(item.index()) {
+            Some(value) => Some(value.clone()),
+            None => None,
+          };
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn text_field(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<String, DbError>
+  intent "Read a required string from an emitted record."
+  requires none
+  ensures none
+  effects none
+{
+  return match field(&nodes, &fields, &name) {
+    Some(JsonNode.Str(value)) => Ok(value),
+    _ => Err(DbError.InvalidSchema("missing required string in observation")),
+  };
+}
+
+fn labels_hash(nodes: &List<JsonNode>, labels: &List<JsonField>) -> Result<Bytes, DbError>
+  intent "Hash the name-sorted, length-delimited normalized label pairs."
+  requires none
+  ensures none
+  effects none
+{
+  let mut encoded = Bytes.new();
+  let mut previous = Bytes.new();
+  let mut count = 0;
+  while count < labels.len() {
+    let mut selected = -1;
+    let mut least = Bytes.new();
+    let mut i = 0;
+    while i < labels.len() {
+      match labels.get(i) {
+        Some(label) => {
+          let key = label.name().as_bytes();
+          if (count == 0 || compare_bytes(&key, &previous) > 0) && (selected < 0 || compare_bytes(&key, &least) < 0) {
+            selected = i;
+            least = key;
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    let label = match labels.get(selected) {
+      Some(item) => Ok(item.clone()),
+      None => Err(DbError.InvalidSchema("duplicate metric label")),
+    }?;
+    let name = label.name();
+    let value = match nodes.get(label.index()) {
+      Some(JsonNode.Str(text)) => Ok(text.clone()),
+      _ => Err(DbError.InvalidSchema("missing metric label value")),
+    }?;
+    encode_value(&Value.StrVal(name), &mut encoded);
+    encode_value(&Value.StrVal(value), &mut encoded);
+    previous = least;
+    count = count + 1;
+  }
+  return Ok(sha256(&encoded));
+}
+
+fn normalized_timestamp(ts: String) -> Result<String, DbError>
+  intent "Normalize millisecond and microsecond spellings of the same instant for storage keys."
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = ts.as_bytes();
+  if bytes.byte_len() == 24 {
+    let mut normalized = bytes.slice(0, 23).map_err(|error| DbError.InvalidSchema(error))?;
+    normalized.extend(&"000Z".as_bytes());
+    return normalized.to_string_utf8().map_err(|error| DbError.InvalidSchema(error));
+  }
+  return Ok(ts);
+}
+
+fn decode_record(data: Bytes) -> Result<Record, DbError>
+  intent "Derive index fields and retain the original NDJSON bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let parsed = json.parse(&data).map_err(|error| DbError.InvalidSchema("invalid observation JSON"))?;
+  let nodes = parsed.nodes();
+  let root = parsed.root();
+  let fields = match nodes.get(root) {
+    Some(JsonNode.Object(items)) => Ok(items.clone()),
+    _ => Err(DbError.InvalidSchema("expected observation object")),
+  }?;
+  let ts = normalized_timestamp(text_field(&nodes, &fields, &"ts")?)?;
+  let component = text_field(&nodes, &fields, &"component")?;
+  let component_hash = sha256(&component.as_bytes());
+  let key = match field(&nodes, &fields, &"labels") {
+    Some(JsonNode.Object(labels)) => metric_key(&nodes, &fields, &labels, &ts, component)?,
+    _ => RecordKey.Log(text_field(&nodes, &fields, &"level")?),
+  };
+  return Ok(Record { key: key, ts: ts, component: component_hash, data: data });
+}
+
+fn metric_key(nodes: &List<JsonNode>, fields: &List<JsonField>, labels: &List<JsonField>, ts: &String, component: String) -> Result<RecordKey, DbError>
+  intent "Encode the component, metric name, instant and label hash into a bounded unique key."
+  requires none
+  ensures none
+  effects none
+{
+  let hash = labels_hash(&nodes, &labels)?;
+  let name = text_field(&nodes, &fields, &"name")?;
+  let mut key = Bytes.new();
+  encode_value(&Value.StrVal(component), &mut key);
+  encode_value(&Value.StrVal(name), &mut key);
+  encode_value(&Value.StrVal(ts.clone()), &mut key);
+  encode_value(&Value.BytesVal(hash.clone()), &mut key);
+  return Ok(RecordKey.Metric(sha256(&key), hash));
+}
+
+fn schema(database: &Database, tx: &mut Tx) -> Result<Bool, DbError>
+  intent "Create observation tables and log indexes in one transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  if rel_table_exists(&database, &mut tx, &"argus_logs")? {
+    return Ok(true);
+  }
+  let mut logs = List.new();
+  logs.push(column("id", tag_int()));
+  logs.push(column("ts", tag_str()));
+  logs.push(column("component_hash", tag_bytes()));
+  logs.push(column("level", tag_str()));
+  logs.push(column("chunks", tag_int()));
+  rel_create_table(&database, &mut tx, &"argus_logs", &logs, &"id")?;
+  rel_create_index(&database, &mut tx, &"argus_log_ts", &"argus_logs", &"ts", false)?;
+  rel_create_index(&database, &mut tx, &"argus_log_component", &"argus_logs", &"component_hash", false)?;
+  rel_create_index(&database, &mut tx, &"argus_log_level", &"argus_logs", &"level", false)?;
+
+  let mut metrics = List.new();
+  metrics.push(column("key", tag_bytes()));
+  metrics.push(column("ts", tag_str()));
+  metrics.push(column("component_hash", tag_bytes()));
+  metrics.push(column("labels_hash", tag_bytes()));
+  metrics.push(column("chunks", tag_int()));
+  rel_create_table(&database, &mut tx, &"argus_metrics", &metrics, &"key")?;
+
+  let mut chunks = List.new();
+  chunks.push(column("key", tag_bytes()));
+  chunks.push(column("data", tag_bytes()));
+  return rel_create_table(&database, &mut tx, &"argus_payloads", &chunks, &"key");
+}
+
+fn finish(database: &mut Database, tx: &mut Tx, staged: Result<Bool, DbError>) -> Result<Bool, DbError>
+  intent "Commit staged changes or release the transaction on an error."
+  requires none
+  ensures none
+  effects fs
+{
+  let outcome = match staged {
+    Ok(_) => tx_commit(&mut tx, &mut database),
+    Err(error) => Err(error),
+  };
+  if !outcome.is_ok() {
+    let _ = tx_rollback(&mut tx, &mut database);
+  }
+  return outcome;
+}
+
+pub fn initialize(database: &mut Database) -> Result<Bool, DbError>
+  intent "Initialize the adapter on a sigil-db database before writing batches."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let staged = schema(&database, &mut tx);
+  return finish(&mut database, &mut tx, staged);
+}
+
+fn last_log_id(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "Read the highest committed append ID while holding the database transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Desc, 1)?;
+  if rows.len() > 0 {
+    let row = match rows.get(0) {
+      Some(item) => Ok(item.clone()),
+      None => Err(DbError.Corrupt("missing observation log row")),
+    }?;
+    return match row.get(0) {
+      Some(Value.IntVal(id)) => Ok(id + 0),
+      _ => Err(DbError.Corrupt("invalid observation log ID")),
+    };
+  }
+  return Ok(0);
+}
+
+fn stage(database: &Database, tx: &mut Tx, records: &List<Record>) -> Result<Bool, DbError>
+  intent "Append all record headers, indexes and payload chunks in the same transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut log_id = last_log_id(&database, &mut tx)?;
+  let mut i = 0;
+  while i < records.len() {
+    let record = match records.get(i) {
+      Some(item) => Ok(item.clone()),
+      None => Err(DbError.Corrupt("missing buffered observation")),
+    }?;
+    let mut row = List.new();
+    let mut payload_key = Bytes.new();
+    let table = match &record.key {
+      RecordKey.Log(_) => "argus_logs",
+      RecordKey.Metric(_, _) => "argus_metrics",
+    };
+    match &record.key {
+      RecordKey.Log(_) => {
+        if log_id == 9223372036854775807 {
+          return Err(DbError.Limit("observation log ID exhausted"));
+        }
+        log_id = log_id + 1;
+        row.push(Value.IntVal(log_id));
+      }
+      RecordKey.Metric(key, _) => {
+        row.push(Value.BytesVal(key.clone()));
+      }
+    }
+    match row.get(0) {
+      Some(key) => {
+        encode_value(&key, &mut payload_key);
+      }
+      None => {
+        return Err(DbError.Corrupt("missing observation key"));
+      }
+    }
+    row.push(Value.StrVal(record.ts.clone()));
+    row.push(Value.BytesVal(record.component.clone()));
+    match &record.key {
+      RecordKey.Log(level) => {
+        row.push(Value.StrVal(level.clone()));
+      }
+      RecordKey.Metric(_, hash) => {
+        row.push(Value.BytesVal(hash.clone()));
+      }
+    }
+    row.push(Value.IntVal((record.data.byte_len() - 1) / 4000 + 1));
+    rel_insert(&database, &mut tx, &table, &row)?;
+    let mut start = 0;
+    while start < record.data.byte_len() {
+      let mut end = start + 4000;
+      if end > record.data.byte_len() {
+        end = record.data.byte_len();
+      }
+      let mut key = payload_key.clone();
+      key.push_u64_be(start / 4000);
+      let data = record.data.slice(start, end).map_err(|error| DbError.Corrupt(error))?;
+      let mut chunk = List.new();
+      chunk.push(Value.BytesVal(key));
+      chunk.push(Value.BytesVal(data));
+      rel_insert(&database, &mut tx, &"argus_payloads", &chunk)?;
+      start = end;
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+impl Batch {
+  pub fn len(self: &Batch) -> Int
+    intent "Read the number of pending observations."
+    requires none
+    ensures none
+    effects none
+  {
+    return self.records.len();
+  }
+
+  pub fn append(self: &mut Batch, line: &Line) -> Result<Bool, DbError>
+    intent "Queue an emitted log or metric without exceeding the byte budget."
+    requires none
+    ensures none
+    effects none
+  {
+    if self.uncertain {
+      return Err(DbError.CommitUnknown("previous flush outcome must be reconciled"));
+    }
+    let data = line.ndjson();
+    if data.byte_len() > self.limit - self.size {
+      return Err(DbError.Limit("observation batch is full"));
+    }
+    let size = data.byte_len();
+    self.records.push(decode_record(data)?);
+    self.size = self.size + size;
+    return Ok(true);
+  }
+
+  pub fn clear(self: &mut Batch)
+    intent "Explicitly discard all pending observations."
+    requires none
+    ensures none
+    effects none
+  {
+    self.records = List.new();
+    self.size = 0;
+    self.uncertain = false;
+  }
+
+  pub fn flush(self: &mut Batch, database: &mut Database) -> Result<Int, DbError>
+    intent "Persist the batch atomically and consume it on confirmed commit."
+    requires none
+    ensures none
+    effects fs
+  {
+    if self.uncertain {
+      return Err(DbError.CommitUnknown("previous flush outcome must be reconciled"));
+    }
+    let count = self.len();
+    if count == 0 {
+      return Ok(0);
+    }
+    let mut tx = begin_tx(&mut database)?;
+    let staged = stage(&database, &mut tx, &self.records);
+    match finish(&mut database, &mut tx, staged) {
+      Ok(_) => {
+        self.clear();
+        return Ok(count);
+      }
+      Err(error) => {
+        self.uncertain = is_commit_unknown(&error);
+        return Err(error);
+      }
+    }
+  }
+}

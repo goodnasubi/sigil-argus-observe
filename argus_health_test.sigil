@@ -1,0 +1,182 @@
+module argus_health_test
+  targets server
+  trust none
+
+use argus_health.Health;
+use argus_health.HealthError;
+use argus_health.Probe;
+use argus_health.default_heartbeat;
+use argus_health.default_pull;
+use argus_health.pull;
+
+struct MockClock {
+  now: Int,
+}
+
+impl MockClock {
+  fn advance(self: &mut MockClock, elapsed: Int)
+    intent "Advance the test clock without sleeping."
+    requires none
+    ensures none
+    effects none
+  {
+    self.now = self.now + elapsed;
+  }
+}
+
+fn pull_timeout() -> Int
+  intent "Test due times, inclusive deadlines, consecutive failures and recovery."
+  requires none
+  ensures none
+  effects none
+{
+  let mut time_source = MockClock { now: 0 };
+  let mut monitor = default_pull();
+  if !monitor.due(time_source.now) || !monitor.observe(time_source.now, 2999, true).is_none() {
+    return 1;
+  }
+  time_source.advance(9999);
+  if monitor.due(time_source.now) || !monitor.observe(time_source.now, 3000, true).is_none() {
+    return 2;
+  }
+  time_source.advance(1);
+  match monitor.observe(time_source.now, 3000, true) {
+    Some(Health.Degraded) => {}
+    _ => {
+      return 3;
+    }
+  }
+  time_source.advance(10000);
+  if !monitor.observe(time_source.now, 0, false).is_none() {
+    return 4;
+  }
+  time_source.advance(10000);
+  match monitor.observe(time_source.now, 3000, false) {
+    Some(Health.Dead) => {}
+    _ => {
+      return 5;
+    }
+  }
+  time_source.advance(10000);
+  if !monitor.observe(time_source.now, 0, false).is_none() {
+    return 6;
+  }
+  time_source.advance(10000);
+  match monitor.observe(time_source.now, 1, true) {
+    Some(Health.Healthy) => {}
+    _ => {
+      return 7;
+    }
+  }
+  time_source.advance(10000);
+  match monitor.observe(time_source.now, 0, false) {
+    Some(Health.Degraded) => {}
+    _ => {
+      return 8;
+    }
+  }
+  if pull(100, 101, 1).is_ok() {
+    return 9;
+  }
+  return 0;
+}
+
+fn heartbeat_timeout() -> Result<Int, HealthError>
+  intent "Test heartbeat grace, exact expiry, recovery and stale pings."
+  requires none
+  ensures none
+  effects none
+{
+  let mut time_source = MockClock { now: 7 };
+  let mut monitor = default_heartbeat(time_source.now)?;
+  time_source.advance(20000);
+  if !monitor.ping(time_source.now).is_none() {
+    return Ok(10);
+  }
+  time_source.advance(29999);
+  match monitor.status(time_source.now) {
+    Health.Healthy => {}
+    _ => {
+      return Ok(11);
+    }
+  }
+  time_source.advance(1);
+  match monitor.status(time_source.now) {
+    Health.Dead => {}
+    _ => {
+      return Ok(12);
+    }
+  }
+  match monitor.ping(time_source.now) {
+    Some(Health.Healthy) => {}
+    _ => {
+      return Ok(13);
+    }
+  }
+  if !monitor.ping(time_source.now - 1).is_none() {
+    return Ok(14);
+  }
+  time_source.advance(29999);
+  return match monitor.status(time_source.now) {
+    Health.Healthy => Ok(0),
+    _ => Ok(15),
+  };
+}
+
+pub fn main() -> Int
+  intent "Run deterministic liveness unit tests."
+  requires none
+  ensures none
+  effects none
+{
+  let failure = pull_timeout();
+  if failure != 0 {
+    return failure;
+  }
+  return heartbeat_timeout().unwrap_or(16);
+}
+
+fn check_loopback() -> Result<Int, HealthError>
+  intent "Exercise real TCP, successful and failed HTTP, and a read deadline."
+  requires none
+  ensures none
+  effects clock, env, net.client, task.spawn, task.suspend
+{
+  let host = "127.0.0.1";
+  let tcp_port = env.get(&"ARGUS_TCP_PORT").unwrap_or("").parse_int().unwrap_or(0);
+  let http_port = env.get(&"ARGUS_HTTP_PORT").unwrap_or("").parse_int().unwrap_or(0);
+  let error_port = env.get(&"ARGUS_ERROR_PORT").unwrap_or("").parse_int().unwrap_or(0);
+  let slow_port = env.get(&"ARGUS_SLOW_PORT").unwrap_or("").parse_int().unwrap_or(0);
+  let mut monitor = pull(1000, 1000, 1)?;
+  match monitor.poll(&Probe.Http(host.clone(), error_port), 0) {
+    Some(Health.Dead) => {}
+    _ => {
+      return Ok(21);
+    }
+  }
+  match monitor.poll(&Probe.Http(host.clone(), http_port), 1000) {
+    Some(Health.Healthy) => {}
+    _ => {
+      return Ok(22);
+    }
+  }
+  match monitor.poll(&Probe.Http(host.clone(), slow_port), 2000) {
+    Some(Health.Dead) => {}
+    _ => {
+      return Ok(23);
+    }
+  }
+  return match monitor.poll(&Probe.Tcp(host, tcp_port), 3000) {
+    Some(Health.Healthy) => Ok(0),
+    _ => Ok(24),
+  };
+}
+
+pub fn loopback() -> Int
+  intent "Run the loopback probe integration tests."
+  requires none
+  ensures none
+  effects clock, env, net.client, task.spawn, task.suspend
+{
+  return check_loopback().unwrap_or(25);
+}

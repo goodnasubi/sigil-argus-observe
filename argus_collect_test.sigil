@@ -1,0 +1,226 @@
+module argus_collect_test
+  targets server
+  trust none
+
+use argus_collect.batch;
+use argus_collect.initialize;
+use argus_observe.Level;
+use argus_observe.Line;
+use argus_observe.MetricKind;
+use argus_observe.label;
+use argus_observe.log_context;
+use argus_observe.log_line;
+use argus_observe.metric;
+use db.database.Database;
+use db.database.begin_tx;
+use db.database.open_database;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.error.error_message;
+use db.error.is_duplicate_key;
+use db.error.is_limit;
+use db.relation.ScanOrder;
+use db.relation.rel_get;
+use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.types.Value;
+use db.types.compare_bytes;
+use db.types.encode_value;
+
+fn expect(ok: Bool, message: String) -> Result<Bool, DbError>
+  intent "Report the failed storage assertion."
+  requires none
+  ensures none
+  effects none
+{
+  if !ok {
+    return Err(DbError.Corrupt(message));
+  }
+  return Ok(true);
+}
+
+fn sample(component: &String, ts: &String, reverse: Bool) -> Result<Line, DbError>
+  intent "Emit the same metric series with alternate label ordering."
+  requires none
+  ensures none
+  effects none
+{
+  let mut labels = List.new();
+  if reverse {
+    labels.push(label("zone", "east"));
+    labels.push(label("queue", "jobs"));
+  } else {
+    labels.push(label("queue", "jobs"));
+    labels.push(label("zone", "east"));
+  }
+  let series = metric(&component, &"jobs_total", MetricKind.Counter, &labels).map_err(|error| DbError.Corrupt("metric fixture"))?;
+  let lines = series.snapshot(&ts).map_err(|error| DbError.Corrupt("sample fixture"))?;
+  return match lines.get(0) {
+    Some(line) => Ok(line.clone()),
+    None => Err(DbError.Corrupt("missing sample fixture")),
+  };
+}
+
+fn long_log() -> Result<Line, DbError>
+  intent "Emit a log at the 65536-byte wire limit."
+  requires none
+  ensures none
+  effects none
+{
+  let mut bytes = Bytes.new();
+  let mut i = 0;
+  while i < 65536 {
+    bytes.push(120);
+    i = i + 1;
+  }
+  let message = bytes.to_string_utf8().map_err(|error| DbError.Corrupt(error))?;
+  let context = log_context(None, None, None, None, None);
+  return log_line(&"2026-11-27T00:00:00.001Z", &"worker-a", Level.Warn, &message, &context).map_err(|error| DbError.Corrupt("log fixture"));
+}
+
+fn database_id() -> Bytes
+  intent "Return a fixed sixteen-byte test database ID."
+  requires none
+  ensures none
+  effects none
+{
+  let mut id = Bytes.new();
+  id.push_u64_be(1);
+  id.push_u64_be(2);
+  return id;
+}
+
+fn write_fixture(database: &mut Database) -> Result<Bool, DbError>
+  intent "Verify atomic rollback, bounded buffering and mixed-batch commit."
+  requires none
+  ensures none
+  effects fs
+{
+  initialize(&mut database)?;
+  initialize(&mut database)?;
+  let log = long_log()?;
+  expect(log.ndjson().byte_len() == 65536, "expected a maximum-sized log")?;
+  let ts = "2026-11-27T00:00:00.001Z";
+  let first = sample(&"worker-a", &ts, false)?;
+  let other = sample(&"worker-b", &ts, false)?;
+  let duplicate = sample(&"worker-a", &"2026-11-27T00:00:00.001000Z", true)?;
+  let mut pending = batch(65536)?;
+  pending.append(&log)?;
+  match pending.append(&first) {
+    Err(error) => {
+      expect(is_limit(&error), "batch budget error")?;
+    }
+    Ok(_) => {
+      return Err(DbError.Corrupt("batch budget exceeded"));
+    }
+  }
+  expect(pending.len() == 1, "limit rejection changed the buffer")?;
+
+  let context = log_context(None, None, None, None, None);
+  let short = log_line(&ts, &"worker-a", Level.Warn, &"short", &context).map_err(|error| DbError.Corrupt("short log fixture"))?;
+  let mut mixed = batch(100000)?;
+  mixed.append(&short)?;
+  mixed.append(&first)?;
+  mixed.append(&duplicate)?;
+  match mixed.flush(&mut database) {
+    Err(error) => {
+      expect(is_duplicate_key(&error), "expected a normalized metric duplicate")?;
+    }
+    Ok(_) => {
+      return Err(DbError.Corrupt("duplicate metric committed"));
+    }
+  }
+  expect(mixed.len() == 3, "failed flush lost pending records")?;
+  mixed.clear();
+  mixed.append(&log)?;
+  mixed.append(&first)?;
+  mixed.append(&other)?;
+  expect(mixed.flush(&mut database)? == 3, "wrong committed count")?;
+  expect(mixed.flush(&mut database)? == 0, "successful flush did not clear batch")?;
+  mixed.append(&short)?;
+  mixed.append(&short)?;
+  expect(mixed.flush(&mut database)? == 2, "identical logs must append")?;
+  return Ok(true);
+}
+
+fn verify_fixture(database: &mut Database) -> Result<Bool, DbError>
+  intent "Reopen the WAL, verify primary and secondary indexes and reassemble all log bytes."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut tx = begin_tx(&mut database)?;
+  let logs = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 10)?;
+  let metrics = rel_scan(&database, &mut tx, &"argus_metrics", &None, &None, &ScanOrder.Asc, 10)?;
+  let time = Some(Value.StrVal("2026-11-27T00:00:00.001000Z"));
+  let level = Some(Value.StrVal("WARN"));
+  let component = Some(Value.BytesVal(sha256(&"worker-a".as_bytes())));
+  let by_time = rel_scan_index(&database, &mut tx, &"argus_log_ts", &time, &time, &ScanOrder.Asc, 10)?;
+  let by_component = rel_scan_index(&database, &mut tx, &"argus_log_component", &component, &component, &ScanOrder.Asc, 10)?;
+  let by_level = rel_scan_index(&database, &mut tx, &"argus_log_level", &level, &level, &ScanOrder.Asc, 10)?;
+  expect(logs.len() == 3 && metrics.len() == 2, "rollback or reopen changed record counts")?;
+  expect(by_time.len() == 3 && by_component.len() == 3 && by_level.len() == 3, "missing log index entries")?;
+
+  let mut data = Bytes.new();
+  let mut chunk = 0;
+  while chunk < 17 {
+    let mut key = Bytes.new();
+    encode_value(&Value.IntVal(1), &mut key);
+    key.push_u64_be(chunk);
+    match rel_get(&database, &mut tx, &"argus_payloads", &Value.BytesVal(key))? {
+      Some(row) => {
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            data.extend(&bytes);
+          }
+          _ => {
+            return Err(DbError.Corrupt("invalid chunk"));
+          }
+        }
+      }
+      None => {
+        return Err(DbError.Corrupt("missing chunk"));
+      }
+    }
+    chunk = chunk + 1;
+  }
+  tx_rollback(&mut tx, &mut database)?;
+  return expect(compare_bytes(&data, &long_log()?.ndjson()) == 0, "round-trip changed the NDJSON bytes");
+}
+
+pub fn main() -> Int
+  intent "Run the write or reopen half of the storage integration test."
+  requires none
+  ensures none
+  effects console, env, fs
+{
+  let path = env.get(&"ARGUS_TEST_DB").unwrap_or("");
+  if path == "" {
+    return 1;
+  }
+  match open_database(path, database_id()) {
+    Err(error) => {
+      console.log(&error_message(&error));
+      return 2;
+    }
+    Ok(database) => {
+      let mut handle = database;
+      let outcome = env.get(&"ARGUS_TEST_MODE").unwrap_or("");
+      let checked = match outcome {
+        "write" => write_fixture(&mut handle),
+        "verify" => verify_fixture(&mut handle),
+        _ => Err(DbError.Corrupt("unknown test mode")),
+      };
+      // Leave the WAL for the next process, without a close-time checkpoint.
+      match checked {
+        Ok(_) => {
+          return 0;
+        }
+        Err(error) => {
+          console.log(&error_message(&error));
+          return 3;
+        }
+      }
+    }
+  }
+}

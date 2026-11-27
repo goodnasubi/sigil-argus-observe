@@ -1,0 +1,275 @@
+module argus_health
+  targets server
+  trust none
+
+pub enum Health {
+  Healthy,
+  Degraded,
+  Dead,
+}
+
+pub enum Probe {
+  Http(String, Int),
+  Tcp(String, Int),
+}
+
+pub enum HealthError {
+  InvalidPolicy,
+}
+
+pub struct Pull {
+  interval_ms: Int,
+  timeout_ms: Int,
+  failure_limit: Int,
+  failures: Int,
+  last_started: Option<Int>,
+  current: Health,
+}
+
+pub struct Heartbeat {
+  timeout_ms: Int,
+  last_seen: Int,
+}
+
+pub fn pull(interval_ms: Int, timeout_ms: Int, failure_limit: Int) -> Result<Pull, HealthError>
+  intent "Configure the polling cadence, deadline and consecutive failure threshold."
+  requires none
+  ensures none
+  effects none
+{
+  if timeout_ms <= 0 || interval_ms < timeout_ms || failure_limit <= 0 {
+    return Err(HealthError.InvalidPolicy);
+  }
+  return Ok(Pull { interval_ms: interval_ms, timeout_ms: timeout_ms, failure_limit: failure_limit, failures: 0, last_started: None, current: Health.Healthy });
+}
+
+pub fn default_pull() -> Pull
+  intent "Use a ten-second interval, three-second deadline and three failures."
+  requires none
+  ensures none
+  effects none
+{
+  return Pull { interval_ms: 10000, timeout_ms: 3000, failure_limit: 3, failures: 0, last_started: None, current: Health.Healthy };
+}
+
+impl Pull {
+  pub fn status(self: &Pull) -> Health
+    intent "Read the latest pull health."
+    requires none
+    ensures none
+    effects none
+  {
+    return self.current.clone();
+  }
+
+  pub fn due(self: &Pull, now_ms: Int) -> Bool
+    intent "Check the interval since the last actual probe on a nonnegative monotonic clock."
+    requires none
+    ensures none
+    effects none
+  {
+    if now_ms < 0 {
+      return false;
+    }
+    return match self.last_started {
+      None => true,
+      Some(last) => now_ms - last >= self.interval_ms,
+    };
+  }
+
+  pub fn observe(self: &mut Pull, started_ms: Int, elapsed_ms: Int, success: Bool) -> Option<Health>
+    intent "Record one due probe and return only a health transition."
+    requires none
+    ensures none
+    effects none
+  {
+    if !self.due(started_ms) || elapsed_ms < 0 {
+      return None;
+    }
+    self.last_started = Some(started_ms);
+    let previous = self.failures;
+    if success && elapsed_ms < self.timeout_ms {
+      self.failures = 0;
+      self.current = Health.Healthy;
+      if previous > 0 {
+        return Some(Health.Healthy);
+      }
+      return None;
+    }
+    if self.failures < self.failure_limit {
+      self.failures = self.failures + 1;
+    }
+    if self.failures == self.failure_limit {
+      self.current = Health.Dead;
+      if previous < self.failure_limit {
+        return Some(Health.Dead);
+      }
+    } else {
+      self.current = Health.Degraded;
+      if previous == 0 {
+        return Some(Health.Degraded);
+      }
+    }
+    return None;
+  }
+}
+
+pub fn heartbeat(started_ms: Int, timeout_ms: Int) -> Result<Heartbeat, HealthError>
+  intent "Start a heartbeat grace window on a nonnegative monotonic clock."
+  requires none
+  ensures none
+  effects none
+{
+  if started_ms < 0 || timeout_ms <= 0 {
+    return Err(HealthError.InvalidPolicy);
+  }
+  return Ok(Heartbeat { timeout_ms: timeout_ms, last_seen: started_ms });
+}
+
+pub fn default_heartbeat(started_ms: Int) -> Result<Heartbeat, HealthError>
+  intent "Use a thirty-second heartbeat deadline."
+  requires none
+  ensures none
+  effects none
+{
+  return heartbeat(started_ms, 30000);
+}
+
+impl Heartbeat {
+  pub fn status(self: &Heartbeat, now_ms: Int) -> Health
+    intent "Evaluate heartbeat expiry at the deadline."
+    requires none
+    ensures none
+    effects none
+  {
+    if now_ms >= self.last_seen && now_ms - self.last_seen >= self.timeout_ms {
+      return Health.Dead;
+    }
+    return Health.Healthy;
+  }
+
+  pub fn ping(self: &mut Heartbeat, now_ms: Int) -> Option<Health>
+    intent "Accept a heartbeat at its receipt time and report recovery."
+    requires none
+    ensures none
+    effects none
+  {
+    if now_ms < self.last_seen {
+      return None;
+    }
+    let previous = self.status(now_ms);
+    self.last_seen = now_ms;
+    return match previous {
+      Health.Dead => Some(Health.Healthy),
+      _ => None,
+    };
+  }
+}
+
+fn http_success(line: &Bytes) -> Bool
+  intent "Recognize a complete HTTP/1.x status line with a 2xx response."
+  requires none
+  ensures none
+  effects none
+{
+  let n = line.byte_len();
+  if n < 15 || line.get(n - 2).unwrap_or(0) != 13 {
+    return false;
+  }
+  let prefix = line.slice(0, 8).unwrap_or(Bytes.new());
+  let version = prefix.to_string_utf8().unwrap_or("");
+  if version != "HTTP/1.0" && version != "HTTP/1.1" {
+    return false;
+  }
+  let tens = line.get(10).unwrap_or(0);
+  let ones = line.get(11).unwrap_or(0);
+  return line.get(8).unwrap_or(0) == 32 && line.get(9).unwrap_or(0) == 50 && tens >= 48 && tens <= 57 && ones >= 48 && ones <= 57 && line.get(12).unwrap_or(0) == 32;
+}
+
+fn check_http(host: &String, port: Int) -> Result<Bool, NetError>
+  intent "Request /healthz and read at most 1024 bytes of its status line."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  let mut client = net.connect(&host, port)?;
+  let address = host.as_bytes();
+  let mut ipv6 = false;
+  let mut i = 0;
+  while i < address.byte_len() {
+    ipv6 = ipv6 || address.get(i).unwrap_or(0) == 58;
+    i = i + 1;
+  }
+  let mut request = "GET /healthz HTTP/1.1\r\nHost: ".as_bytes();
+  if ipv6 {
+    request.push(91);
+  }
+  request.extend(&address);
+  if ipv6 {
+    request.push(93);
+  }
+  request.push(58);
+  let mut divisor = 10000;
+  while divisor > port {
+    divisor = divisor / 10;
+  }
+  while divisor > 0 {
+    request.push(48 + port / divisor % 10);
+    divisor = divisor / 10;
+  }
+  request.extend(&"\r\nConnection: close\r\n\r\n".as_bytes());
+  client.write_all(&request)?;
+  let mut status = Bytes.new();
+  while status.byte_len() < 1024 {
+    let data = client.read(1024 - status.byte_len())?;
+    if data.byte_len() == 0 {
+      return Ok(false);
+    }
+    let mut offset = 0;
+    while offset < data.byte_len() {
+      let byte = data.get(offset).unwrap_or(0);
+      status.push(byte);
+      if byte == 10 {
+        return Ok(http_success(&status));
+      }
+      offset = offset + 1;
+    }
+  }
+  return Ok(false);
+}
+
+fn check_probe(probe: &Probe) -> Bool
+  intent "Perform an HTTP health request or establish and close a TCP connection."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  match probe {
+    Probe.Http(host, port) => {
+      if port >= 1 && port <= 65535 {
+        return check_http(&host, port).unwrap_or(false);
+      }
+    }
+    Probe.Tcp(host, port) => {
+      if port >= 1 && port <= 65535 {
+        return net.connect(&host, port).is_ok();
+      }
+    }
+  }
+  return false;
+}
+
+impl Pull {
+  pub fn poll(self: &mut Pull, probe: &Probe, now_ms: Int) -> Option<Health>
+    intent "Run one due probe with a deadline over connect, write and read."
+    requires none
+    ensures none
+    effects clock, net.client, task.spawn, task.suspend
+  {
+    if !self.due(now_ms) {
+      return None;
+    }
+    let outcome = task.timeout(self.timeout_ms, || check_probe(&probe));
+    return self.observe(now_ms, 0, outcome.unwrap_or(false));
+  }
+}
