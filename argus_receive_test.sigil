@@ -773,6 +773,15 @@ fn defense_flood(port: Int) -> Result<Int, Int>
   if clamp != 0 {
     return Err(clamp);
   }
+  // Without a limit, or with an unusable one, the default page size is clamped to the maximum too.
+  let missing = expect(get(port, "/api/logs"), 200, &"\"count\":3", 471);
+  if missing != 0 {
+    return Err(missing);
+  }
+  let invalid = expect(get(port, "/api/logs?limit=abc"), 200, &"\"count\":3", 472);
+  if invalid != 0 {
+    return Err(invalid);
+  }
   // Scanning is bounded too: 4 of the 6 stored samples are looked at and the answer says it is incomplete.
   let scan = expect(get(port, "/api/metrics?component=sigil-flood&name=load_ratio"), 200, &"\"scanned\":4", 469);
   if scan != 0 {

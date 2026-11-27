@@ -165,7 +165,28 @@ pub fn main() -> Int
   if !rejected_as(accept_line(&wrap_one(&filled(70000))), ObserveError.LogTooLarge) {
     return 32;
   }
+  // Normalization copies the component into the labels: a 40,000-letter component fits as received (about 40 KB)
+  // but not as the canonical record (about 80 KB), so it is refused after normalizing.
+  if !rejected_as(accept_line(&wide_component(40000)), ObserveError.LogTooLarge) {
+    return 33;
+  }
+  if text_of(&accept_line(&wide_component(20000))) == "" {
+    return 34;
+  }
   return 0;
+}
+
+fn wide_component(count: Int) -> String
+  intent "A gauge sample from a component name of count letters with no labels."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"");
+  parts.push(filled(count));
+  parts.push("\",\"name\":\"x\",\"type\":\"gauge\",\"value\":1,\"labels\":{}}");
+  return wrap(&parts);
 }
 
 fn wrap_one(text: &String) -> String

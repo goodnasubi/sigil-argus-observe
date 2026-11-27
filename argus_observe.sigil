@@ -685,6 +685,10 @@ fn sample_line(ts: &String, component: &String, labels: &List<Label>, name: Stri
   let root = nodes.len();
   nodes.push(JsonNode.Object(members));
   let encoded = json_bytes(&JsonValue.new(nodes, root))?;
+  // The component is copied into the labels, so the canonical record can be larger than what was received.
+  if encoded.byte_len() + 1 > 65536 {
+    return Err(ObserveError.LogTooLarge);
+  }
   return Ok(Line { json_text: utf8(&encoded)? });
 }
 

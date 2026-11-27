@@ -966,11 +966,15 @@ fn int_param(query: &String, name: &String, fallback: Int, limit: Int) -> Int
   ensures none
   effects none
 {
+  let mut base = fallback;
+  if base > limit {
+    base = limit;
+  }
   match query_value(&query, &name) {
     Some(text) => {
       let value = parse_number(&text.as_bytes());
       if value < 0 {
-        return fallback;
+        return base;
       }
       if value > limit {
         return limit;
@@ -979,7 +983,7 @@ fn int_param(query: &String, name: &String, fallback: Int, limit: Int) -> Int
     }
     None => {}
   }
-  return fallback;
+  return base;
 }
 
 fn query_logs(hub: &Hub, query: &String) -> Result<Bytes, Int>
