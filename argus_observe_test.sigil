@@ -1,0 +1,320 @@
+module argus_observe_test
+  targets server
+  trust none
+
+use argus_observe.Level;
+use argus_observe.Metric;
+use argus_observe.MetricKind;
+use argus_observe.ObserveError;
+use argus_observe.buffer;
+use argus_observe.emit_stdout;
+use argus_observe.label;
+use argus_observe.log_context;
+use argus_observe.log_line;
+use argus_observe.metric;
+
+fn repeat(text: &String, times: Int) -> Result<String, ObserveError>
+  intent "Produce a message at the desired byte boundary."
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = text.as_bytes();
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < times {
+    out.extend(&bytes);
+    i = i + 1;
+  }
+  return out.to_string_utf8().map_err(|error| ObserveError.InvalidJson);
+}
+
+fn logs(ts: &String, component: &String) -> Result<Bool, ObserveError>
+  intent "Check log validation and emit fixtures for independent JSON assertions."
+  requires none
+  ensures none
+  effects console
+{
+  let empty = log_context(None, None, None, None, None);
+  let err = json.parse(&"{\"code\":42,\"message\":\"読み込み失敗\"}".as_bytes()).map_err(|error| ObserveError.InvalidJson)?;
+  let fields = json.parse(&"{\"ok\":false,\"nested\":[null,{\"ratio\":0.5}]}".as_bytes()).map_err(|error| ObserveError.InvalidJson)?;
+  let context = log_context(Some("f81d4fae-7dec-11d0-a765-00a0c91e6bf6"), Some("span"), Some("worker.run"), Some(err), Some(fields));
+  let first = log_line(&ts, &component, Level.Debug, &"quoted \"path\" \\root\r\n次\t行", &context)?;
+  let second = log_line(&"2024-02-29T00:00:00.001Z", &component, Level.Info, &"", &empty)?;
+  let mut sink = buffer();
+  sink.append(&first);
+  sink.append(&second);
+  let expected = first.ndjson().concat(&second.ndjson());
+  if sink.drain() != expected || sink.drain().byte_len() != 0 {
+    return Ok(false);
+  }
+  sink.append(&second);
+  if sink.drain() != second.ndjson() {
+    return Ok(false);
+  }
+
+  let exact_length = 65536 - second.ndjson().byte_len();
+  let exact = repeat(&"a", exact_length)?;
+  let over = repeat(&"a", exact_length + 1)?;
+  // Leave one byte of the budget before a four-byte scalar.
+  let mut utf8_tail = repeat(&"a", exact_length - 19)?.as_bytes();
+  utf8_tail.extend(&"😀aaaaaaaaaaaaaaaaaaaaaaaa".as_bytes());
+  let multibyte = utf8_tail.to_string_utf8().map_err(|error| ObserveError.InvalidJson)?;
+  let escapes = repeat(&"\"\\\t", 15000)?;
+
+  let bad_time = log_line(&"2026-02-29T00:00:00.000Z", &component, Level.Info, &"", &empty);
+  match bad_time {
+    Err(ObserveError.InvalidTimestamp) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  match log_line(&"2026-11-27T11:22:40Z", &component, Level.Info, &"", &empty) {
+    Err(ObserveError.InvalidTimestamp) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  match log_line(&ts, &"sigil--queue", Level.Info, &"", &empty) {
+    Err(ObserveError.InvalidComponent) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let bad_trace = log_context(Some("not-hex"), None, None, None, None);
+  match log_line(&ts, &component, Level.Info, &"", &bad_trace) {
+    Err(ObserveError.InvalidTraceId) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let array = json.parse(&"[]".as_bytes()).map_err(|error| ObserveError.InvalidJson)?;
+  let bad_context = log_context(None, None, None, Some(array), None);
+  match log_line(&ts, &component, Level.Info, &"", &bad_context) {
+    Err(ObserveError.InvalidJson) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let oversized_context = log_context(None, Some(repeat(&"x", 65536)?), None, None, None);
+  match log_line(&ts, &component, Level.Info, &"", &oversized_context) {
+    Err(ObserveError.LogTooLarge) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+
+  emit_stdout(&first);
+  emit_stdout(&second);
+  let ms = "2024-02-29T00:00:00.001Z";
+  emit_stdout(&log_line(&ms, &component, Level.Info, &exact, &empty)?);
+  emit_stdout(&log_line(&ms, &component, Level.Warn, &over, &empty)?);
+  emit_stdout(&log_line(&ms, &component, Level.Error, &multibyte, &empty)?);
+  emit_stdout(&log_line(&ms, &component, Level.Fatal, &escapes, &empty)?);
+  return Ok(true);
+}
+
+fn print_snapshot(series: &Metric, ts: &String) -> Result<Bool, ObserveError>
+  intent "Emit all samples of the current metric state."
+  requires none
+  ensures none
+  effects console
+{
+  let samples = series.snapshot(&ts)?;
+  let mut i = 0;
+  while i < samples.len() {
+    match samples.get(i) {
+      Some(sample) => {
+        emit_stdout(&sample);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(true);
+}
+
+fn metrics(ts: &String, component: &String) -> Result<Bool, ObserveError>
+  intent "Check metric validation and emit samples after valid and rejected updates."
+  requires none
+  ensures none
+  effects console
+{
+  let mut labels = List.new();
+  labels.push(label("component", "wrong-source"));
+  labels.push(label("target_component", "sigil-shield-tls"));
+  labels.push(label("a", "v"));
+  labels.push(label("b", "v"));
+  labels.push(label("c", "v"));
+  labels.push(label("d", "v"));
+  labels.push(label("e", "v"));
+  labels.push(label("f", "v"));
+  labels.push(label("g", "v"));
+  labels.push(label("h", "v"));
+  let mut counter = metric(&component, &"requests_total", MetricKind.Counter, &labels)?;
+  labels.push(label("i", "v"));
+  match metric(&component, &"requests_total", MetricKind.Counter, &labels) {
+    Err(ObserveError.InvalidLabels) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+
+  let empty = List.new();
+  match metric(&component, &"Queue-Depth", MetricKind.Gauge, &empty) {
+    Err(ObserveError.InvalidMetricName) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  match metric(&component, &"1depth", MetricKind.Gauge, &empty) {
+    Err(ObserveError.InvalidMetricName) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let mut duplicate = List.new();
+  duplicate.push(label("queue", "first"));
+  duplicate.push(label("queue", "second"));
+  match metric(&component, &"queue_depth", MetricKind.Gauge, &duplicate) {
+    Err(ObserveError.InvalidLabels) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = counter.record(1.5)?;
+  let _ = counter.record(2.0)?;
+  match counter.record(-1.0) {
+    Err(ObserveError.InvalidNumber) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  match counter.snapshot(&"2026-11-27T11:22:40.123+00:00") {
+    Err(ObserveError.InvalidTimestamp) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = print_snapshot(&counter, &ts)?;
+
+  let mut gauge = metric(&component, &"queue_depth", MetricKind.Gauge, &empty)?;
+  let _ = gauge.record(42.0)?;
+  let _ = gauge.record(-2.5)?;
+  match gauge.record(Float.from_bits(9221120237041090560)) {
+    Err(ObserveError.InvalidNumber) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = print_snapshot(&gauge, &ts)?;
+  let mut other = metric(&"sigil-shield-tls", &"queue_depth", MetricKind.Gauge, &empty)?;
+  let _ = other.record(-2.5)?;
+  let _ = print_snapshot(&other, &ts)?;
+
+  let mut bounds = List.new();
+  bounds.push(0.5);
+  bounds.push(2.0);
+  let mut histogram_labels = List.new();
+  histogram_labels.push(label("a", "v"));
+  histogram_labels.push(label("b", "v"));
+  histogram_labels.push(label("c", "v"));
+  histogram_labels.push(label("d", "v"));
+  histogram_labels.push(label("e", "v"));
+  histogram_labels.push(label("f", "v"));
+  histogram_labels.push(label("g", "v"));
+  histogram_labels.push(label("h", "v"));
+  let mut histogram = metric(&component, &"duration_seconds", MetricKind.Histogram(bounds.clone()), &histogram_labels)?;
+  histogram_labels.push(label("i", "v"));
+  match metric(&component, &"duration_seconds", MetricKind.Histogram(bounds.clone()), &histogram_labels) {
+    Err(ObserveError.InvalidLabels) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let mut reserved = List.new();
+  reserved.push(label("le", "5"));
+  match metric(&component, &"duration_seconds", MetricKind.Histogram(bounds.clone()), &reserved) {
+    Err(ObserveError.InvalidLabels) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  bounds.push(2.0);
+  match metric(&component, &"duration_seconds", MetricKind.Histogram(bounds), &empty) {
+    Err(ObserveError.InvalidBuckets) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = histogram.record(-1.0)?;
+  let _ = histogram.record(0.5)?;
+  let _ = histogram.record(1.25)?;
+  let _ = histogram.record(3.0)?;
+  match histogram.record(Float.from_bits(9218868437227405312)) {
+    Err(ObserveError.InvalidNumber) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = print_snapshot(&histogram, &ts)?;
+
+  let gauge_samples = gauge.snapshot(&ts)?;
+  match gauge_samples.get(0) {
+    Some(sample) => {
+      let mut sink = buffer();
+      sink.append(&sample);
+      if sink.drain() != sample.ndjson() {
+        return Ok(false);
+      }
+    }
+    None => {
+      return Ok(false);
+    }
+  }
+
+  let largest = Float.from_bits(9218868437227405311);
+  let mut overflow = metric(&component, &"bytes_total", MetricKind.Counter, &empty)?;
+  let _ = overflow.record(largest)?;
+  match overflow.record(largest) {
+    Err(ObserveError.Overflow) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = print_snapshot(&overflow, &ts)?;
+
+  let mut histogram_overflow = metric(&component, &"bytes", MetricKind.Histogram(List.new()), &empty)?;
+  let _ = histogram_overflow.record(largest)?;
+  match histogram_overflow.record(largest) {
+    Err(ObserveError.Overflow) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
+  let _ = print_snapshot(&histogram_overflow, &ts)?;
+  return Ok(true);
+}
+
+fn main() -> Int
+  intent "Run log and metric contract tests."
+  requires none
+  ensures none
+  effects console
+{
+  let ts = "2026-11-27T11:22:40.123456Z";
+  let component = "sigil-herald-queue";
+  match logs(&ts, &component) {
+    Ok(true) => {}
+    _ => {
+      return 1;
+    }
+  }
+  match metrics(&ts, &component) {
+    Ok(true) => {}
+    _ => {
+      return 2;
+    }
+  }
+  return 0;
+}

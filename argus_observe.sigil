@@ -1,0 +1,743 @@
+module argus_observe
+  targets server
+  trust none
+
+pub enum ObserveError {
+  InvalidTimestamp,
+  InvalidComponent,
+  InvalidTraceId,
+  InvalidJson,
+  LogTooLarge,
+  InvalidMetricName,
+  InvalidLabels,
+  InvalidNumber,
+  InvalidBuckets,
+  Overflow,
+}
+
+pub enum Level {
+  Debug,
+  Info,
+  Warn,
+  Error,
+  Fatal,
+}
+
+pub struct LogContext {
+  trace_id: Option<String>,
+  span_id: Option<String>,
+  target: Option<String>,
+  err: Option<JsonValue>,
+  fields: Option<JsonValue>,
+}
+
+pub struct Line {
+  json_text: String,
+}
+
+pub struct Buffer {
+  data: Option<Bytes>,
+}
+
+pub struct Label {
+  key: String,
+  value: String,
+}
+
+pub struct Bucket {
+  upper: Float,
+  count: Int,
+}
+
+pub enum MetricKind {
+  Counter,
+  Gauge,
+  Histogram(List<Float>),
+}
+
+pub enum MetricState {
+  Counter(Float),
+  Gauge(Float),
+  Histogram(Int, Float, List<Bucket>),
+}
+
+pub struct Metric {
+  component: String,
+  name: String,
+  labels: List<Label>,
+  state: Option<MetricState>,
+}
+
+fn digit(c: Int) -> Bool
+  intent "Recognize an ASCII decimal digit."
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 48 && c <= 57;
+}
+
+fn lower(c: Int) -> Bool
+  intent "Recognize an ASCII lowercase letter."
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 97 && c <= 122;
+}
+
+fn hex(c: Int) -> Bool
+  intent "Recognize a hexadecimal digit."
+  requires none
+  ensures none
+  effects none
+{
+  return digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+}
+
+fn decimal(bytes: &Bytes, start: Int, end: Int) -> Int
+  intent "Read an ASCII decimal field or return -1."
+  requires none
+  ensures none
+  effects none
+{
+  let mut value = 0;
+  let mut i = start;
+  while i < end {
+    let c = bytes.get(i).unwrap_or(0);
+    if !digit(c) {
+      return -1;
+    }
+    value = value * 10 + c - 48;
+    i = i + 1;
+  }
+  return value;
+}
+
+fn valid_timestamp(ts: &String) -> Bool
+  intent "Validate the UTC calendar timestamp and its fractional precision."
+  requires none
+  ensures none
+  effects none
+{
+  let b = ts.as_bytes();
+  let n = b.byte_len();
+  if n != 24 && n != 27 {
+    return false;
+  }
+  if b.get(4).unwrap_or(0) != 45 || b.get(7).unwrap_or(0) != 45 || b.get(10).unwrap_or(0) != 84 || b.get(13).unwrap_or(0) != 58 || b.get(16).unwrap_or(0) != 58 || b.get(19).unwrap_or(0) != 46 || b.get(n - 1).unwrap_or(0) != 90 {
+    return false;
+  }
+  let year = decimal(&b, 0, 4);
+  let month = decimal(&b, 5, 7);
+  let day = decimal(&b, 8, 10);
+  let hour = decimal(&b, 11, 13);
+  let minute = decimal(&b, 14, 16);
+  let second = decimal(&b, 17, 19);
+  if year < 0 || month < 1 || month > 12 || day < 1 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60 || decimal(&b, 20, n - 1) < 0 {
+    return false;
+  }
+  let mut days = 31;
+  if month == 2 {
+    days = 28;
+    if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+      days = 29;
+    }
+  } else if month == 4 || month == 6 || month == 9 || month == 11 {
+    days = 30;
+  }
+  if second == 60 && (hour != 23 || minute != 59 || day != days) {
+    return false;
+  }
+  return day <= days;
+}
+
+fn valid_component(component: &String) -> Bool
+  intent "Require lowercase ASCII words separated by single hyphens."
+  requires none
+  ensures none
+  effects none
+{
+  let b = component.as_bytes();
+  let mut need_letter = true;
+  let mut i = 0;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if !lower(c) && (c != 45 || need_letter) {
+      return false;
+    }
+    need_letter = c == 45;
+    i = i + 1;
+  }
+  return !need_letter;
+}
+
+fn valid_trace_id(trace_id: &String) -> Bool
+  intent "Accept a nonempty hexadecimal identifier or UUID spelling."
+  requires none
+  ensures none
+  effects none
+{
+  let b = trace_id.as_bytes();
+  let n = b.byte_len();
+  let mut plain = n > 0;
+  let mut uuid = n == 36;
+  let mut i = 0;
+  while i < n && (plain || uuid) {
+    let c = b.get(i).unwrap_or(0);
+    plain = plain && hex(c);
+    if i == 8 || i == 13 || i == 18 || i == 23 {
+      uuid = uuid && c == 45;
+    } else {
+      uuid = uuid && hex(c);
+    }
+    i = i + 1;
+  }
+  return plain || uuid;
+}
+
+fn level_name(level: Level) -> String
+  intent "Get the wire name of a log level."
+  requires none
+  ensures none
+  effects none
+{
+  return match level {
+    Level.Debug => "DEBUG",
+    Level.Info => "INFO",
+    Level.Warn => "WARN",
+    Level.Error => "ERROR",
+    Level.Fatal => "FATAL",
+  };
+}
+
+pub fn log_context(trace_id: Option<String>, span_id: Option<String>, target: Option<String>, err: Option<JsonValue>, fields: Option<JsonValue>) -> LogContext
+  intent "Set the optional context of one log record."
+  requires none
+  ensures none
+  effects none
+{
+  return LogContext { trace_id: trace_id, span_id: span_id, target: target, err: err, fields: fields };
+}
+
+fn json_bytes(value: &JsonValue) -> Result<Bytes, ObserveError>
+  intent "Encode a JSON value with the standard library."
+  requires none
+  ensures none
+  effects none
+{
+  return json.stringify(&value).map_err(|error| ObserveError.InvalidJson);
+}
+
+fn scalar_bytes(value: JsonNode) -> Result<Bytes, ObserveError>
+  intent "Encode a standalone JSON scalar."
+  requires none
+  ensures none
+  effects none
+{
+  let mut nodes = List.new();
+  nodes.push(value);
+  return json_bytes(&JsonValue.new(nodes, 0));
+}
+
+fn add_member(nodes: &mut List<JsonNode>, members: &mut List<JsonField>, key: String, value: JsonNode)
+  intent "Add a JSON object member to a flat node table."
+  requires none
+  ensures none
+  effects none
+{
+  members.push(JsonField.new(key, nodes.len()));
+  nodes.push(value);
+}
+
+fn add_optional_string(nodes: &mut List<JsonNode>, members: &mut List<JsonField>, key: String, value: &Option<String>)
+  intent "Add an optional string when present."
+  requires none
+  ensures none
+  effects none
+{
+  match value {
+    Some(s) => {
+      add_member(&mut nodes, &mut members, key, JsonNode.Str(s.clone()));
+    }
+    None => {}
+  }
+}
+
+fn add_optional_object(out: &mut Bytes, key: String, value: &Option<JsonValue>) -> Result<Bool, ObserveError>
+  intent "Encode an optional object at its final nesting depth."
+  requires none
+  ensures none
+  effects none
+{
+  match value {
+    None => {
+      return Ok(false);
+    }
+    Some(object) => {
+      let mut nodes = object.nodes();
+      match nodes.get(object.root()) {
+        Some(JsonNode.Object(_)) => {}
+        _ => {
+          return Err(ObserveError.InvalidJson);
+        }
+      }
+      let mut member = List.new();
+      member.push(JsonField.new(key, object.root()));
+      let root = nodes.len();
+      nodes.push(JsonNode.Object(member));
+      let encoded = json_bytes(&JsonValue.new(nodes, root))?;
+      let inner = encoded.slice(1, encoded.byte_len() - 1).map_err(|error| ObserveError.InvalidJson)?;
+      out.push(44);
+      out.extend(&inner);
+      return Ok(true);
+    }
+  }
+}
+
+fn utf8_width(c: Int) -> Int
+  intent "Measure one UTF-8 scalar starting at a leading byte."
+  requires none
+  ensures none
+  effects none
+{
+  if c < 128 {
+    return 1;
+  }
+  if c < 224 {
+    return 2;
+  }
+  if c < 240 {
+    return 3;
+  }
+  return 4;
+}
+
+fn message_prefix(msg: &Bytes, budget: Int) -> Bytes
+  intent "Normalize CR and LF and keep whole scalars within the JSON byte budget."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut remaining = budget;
+  let mut i = 0;
+  while i < msg.byte_len() {
+    let c = msg.get(i).unwrap_or(0);
+    let width = utf8_width(c);
+    let mut cost = width;
+    if c == 34 || c == 92 {
+      cost = 2;
+    } else if c < 32 && c != 10 && c != 13 {
+      // std.json writes the remaining controls as six-byte Unicode escapes.
+      cost = 6;
+    }
+    if cost > remaining {
+      return out;
+    }
+    if c == 10 || c == 13 {
+      out.push(32);
+    } else {
+      let mut offset = 0;
+      while offset < width {
+        out.push(msg.get(i + offset).unwrap_or(0));
+        offset = offset + 1;
+      }
+    }
+    remaining = remaining - cost;
+    i = i + width;
+  }
+  return out;
+}
+
+fn utf8(bytes: &Bytes) -> Result<String, ObserveError>
+  intent "Convert valid UTF-8 wire bytes into text."
+  requires none
+  ensures none
+  effects none
+{
+  return bytes.to_string_utf8().map_err(|error| ObserveError.InvalidJson);
+}
+
+pub fn log_line(ts: &String, component: &String, level: Level, msg: &String, context: &LogContext) -> Result<Line, ObserveError>
+  intent "Encode one ADR 0067 log line with a bounded message."
+  requires none
+  ensures none
+  effects none
+{
+  if !valid_timestamp(&ts) {
+    return Err(ObserveError.InvalidTimestamp);
+  }
+  if !valid_component(&component) {
+    return Err(ObserveError.InvalidComponent);
+  }
+  match context.trace_id {
+    Some(id) => {
+      if !valid_trace_id(&id) {
+        return Err(ObserveError.InvalidTraceId);
+      }
+    }
+    None => {}
+  }
+
+  let mut nodes = List.new();
+  let mut members = List.new();
+  add_member(&mut nodes, &mut members, "ts", JsonNode.Str(ts.clone()));
+  add_member(&mut nodes, &mut members, "component", JsonNode.Str(component.clone()));
+  add_member(&mut nodes, &mut members, "level", JsonNode.Str(level_name(level)));
+  add_optional_string(&mut nodes, &mut members, "trace_id", &context.trace_id);
+  add_optional_string(&mut nodes, &mut members, "span_id", &context.span_id);
+  add_optional_string(&mut nodes, &mut members, "target", &context.target);
+  let root = nodes.len();
+  nodes.push(JsonNode.Object(members));
+  let header = json_bytes(&JsonValue.new(nodes, root))?;
+  let mut out = header.slice(0, header.byte_len() - 1).map_err(|error| ObserveError.InvalidJson)?;
+  let _ = add_optional_object(&mut out, "err", &context.err)?;
+  let _ = add_optional_object(&mut out, "fields", &context.fields)?;
+
+  let msg_key = ",\"msg\":".as_bytes();
+  let truncated = ",\"truncated\":true".as_bytes();
+  // Include the closing brace, both message quotes and the LF in the limit.
+  let budget = 65536 - out.byte_len() - msg_key.byte_len() - 4;
+  if budget < 0 {
+    return Err(ObserveError.LogTooLarge);
+  }
+  let input = msg.as_bytes();
+  let mut prefix = message_prefix(&input, budget);
+  if prefix.byte_len() < input.byte_len() {
+    if budget < truncated.byte_len() {
+      return Err(ObserveError.LogTooLarge);
+    }
+    prefix = message_prefix(&input, budget - truncated.byte_len());
+    out.extend(&truncated);
+  }
+  out.extend(&msg_key);
+  out.extend(&scalar_bytes(JsonNode.Str(utf8(&prefix)?))?);
+  out.push(125);
+  return Ok(Line { json_text: utf8(&out)? });
+}
+
+impl Line {
+  pub fn ndjson(self: &Line) -> Bytes
+    intent "Return the JSON object with its terminating LF."
+    requires none
+    ensures none
+    effects none
+  {
+    let mut data = self.json_text.as_bytes();
+    data.push(10);
+    return data;
+  }
+}
+
+pub fn emit_stdout(line: &Line)
+  intent "Emit one JSON object and LF to standard output."
+  requires none
+  ensures none
+  effects console
+{
+  console.log(&line.json_text);
+}
+
+pub fn buffer() -> Buffer
+  intent "Create an empty NDJSON buffer."
+  requires none
+  ensures none
+  effects none
+{
+  return Buffer { data: Some(Bytes.new()) };
+}
+
+impl Buffer {
+  pub fn append(self: &mut Buffer, line: &Line)
+    intent "Append one complete NDJSON line to the buffer."
+    requires none
+    ensures none
+    effects none
+  {
+    let mut data = self.data.take().unwrap_or(Bytes.new());
+    data.extend(&line.json_text.as_bytes());
+    data.push(10);
+    self.data = Some(data);
+  }
+}
+
+impl Buffer {
+  pub fn drain(self: &mut Buffer) -> Bytes
+    intent "Take buffered bytes and leave the buffer empty."
+    requires none
+    ensures none
+    effects none
+  {
+    let data = self.data.take();
+    return data.unwrap_or(Bytes.new());
+  }
+}
+
+pub fn label(key: String, value: String) -> Label
+  intent "Create a user label with a stable value."
+  requires none
+  ensures none
+  effects none
+{
+  return Label { key: key, value: value };
+}
+
+fn valid_metric_name(name: &String) -> Bool
+  intent "Check the ADR metric name alphabet and leading letter."
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  if !lower(b.get(0).unwrap_or(0)) {
+    return false;
+  }
+  let mut i = 1;
+  while i < b.byte_len() {
+    let c = b.get(i).unwrap_or(0);
+    if !lower(c) && !digit(c) && c != 95 {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn normalized_labels(component: &String, labels: &List<Label>, histogram: Bool) -> Result<List<Label>, ObserveError>
+  intent "Enforce unique keys and reserve room for the source and bucket bound."
+  requires none
+  ensures none
+  effects none
+{
+  let mut normalized = List.new();
+  normalized.push(label("component", component.clone()));
+  let mut limit = 10;
+  if histogram {
+    limit = 9;
+  }
+  let mut i = 0;
+  while i < labels.len() {
+    match labels.get(i) {
+      Some(entry) => {
+        if entry.key != "component" {
+          if normalized.len() >= limit || (histogram && entry.key == "le") {
+            return Err(ObserveError.InvalidLabels);
+          }
+          let mut j = 1;
+          while j < normalized.len() {
+            match normalized.get(j) {
+              Some(existing) => {
+                if existing.key == entry.key {
+                  return Err(ObserveError.InvalidLabels);
+                }
+              }
+              None => {}
+            }
+            j = j + 1;
+          }
+          normalized.push(entry.clone());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(normalized);
+}
+
+fn finite(value: Float) -> Bool
+  intent "Reject IEEE 754 infinities and NaNs."
+  requires none
+  ensures none
+  effects none
+{
+  return (Float.to_bits(value) & 9218868437227405312) != 9218868437227405312;
+}
+
+fn histogram_state(bounds: &List<Float>) -> Result<MetricState, ObserveError>
+  intent "Set up strictly increasing finite bounds with zero cumulative counts."
+  requires none
+  ensures none
+  effects none
+{
+  let mut buckets = List.new();
+  let mut previous = 0.0;
+  let mut i = 0;
+  while i < bounds.len() {
+    let upper = match bounds.get(i) {
+      Some(value) => value + 0.0,
+      None => 0.0,
+    };
+    if !finite(upper) || (i > 0 && upper <= previous) {
+      return Err(ObserveError.InvalidBuckets);
+    }
+    buckets.push(Bucket { upper: upper, count: 0 });
+    previous = upper;
+    i = i + 1;
+  }
+  return Ok(MetricState.Histogram(0, 0.0, buckets));
+}
+
+pub fn metric(component: &String, name: &String, kind: MetricKind, labels: &List<Label>) -> Result<Metric, ObserveError>
+  intent "Create a metric with fixed normalized labels and zeroed state."
+  requires none
+  ensures none
+  effects none
+{
+  if !valid_component(&component) {
+    return Err(ObserveError.InvalidComponent);
+  }
+  if !valid_metric_name(&name) {
+    return Err(ObserveError.InvalidMetricName);
+  }
+  let current_state = match kind {
+    MetricKind.Counter => MetricState.Counter(0.0),
+    MetricKind.Gauge => MetricState.Gauge(0.0),
+    MetricKind.Histogram(bounds) => histogram_state(&bounds)?,
+  };
+  let histogram = match &current_state {
+    MetricState.Histogram(_, _, _) => true,
+    _ => false,
+  };
+  let normalized = normalized_labels(&component, &labels, histogram)?;
+  return Ok(Metric { component: component.clone(), name: name.clone(), labels: normalized, state: Some(current_state) });
+}
+
+impl Metric {
+  pub fn record(self: &mut Metric, value: Float) -> Result<Bool, ObserveError>
+    intent "Add a counter delta, set a gauge, or observe a histogram value."
+    requires none
+    ensures none
+    effects none
+  {
+    if !finite(value) {
+      return Err(ObserveError.InvalidNumber);
+    }
+    let current_state = self.state.take().ok_or(ObserveError.InvalidNumber)?;
+    match current_state {
+      MetricState.Counter(current) => {
+        let next = current + value;
+        if value < 0.0 || !finite(next) {
+          self.state = Some(MetricState.Counter(current));
+          if value < 0.0 {
+            return Err(ObserveError.InvalidNumber);
+          }
+          return Err(ObserveError.Overflow);
+        }
+        self.state = Some(MetricState.Counter(next));
+      }
+      MetricState.Gauge(_) => {
+        self.state = Some(MetricState.Gauge(value));
+      }
+      MetricState.Histogram(count, sum, stored) => {
+        let next_sum = sum + value;
+        if count == 9223372036854775807 || !finite(next_sum) {
+          self.state = Some(MetricState.Histogram(count, sum, stored));
+          return Err(ObserveError.Overflow);
+        }
+        let mut buckets = stored;
+        let mut i = 0;
+        while i < buckets.len() {
+          match buckets.get_mut(i) {
+            Some(bucket) => {
+              if value <= bucket.upper {
+                bucket.count = bucket.count + 1;
+              }
+            }
+            None => {}
+          }
+          i = i + 1;
+        }
+        self.state = Some(MetricState.Histogram(count + 1, next_sum, buckets));
+      }
+    }
+    return Ok(true);
+  }
+}
+
+fn metric_line(metric: &Metric, ts: &String, name: String, kind: String, value: JsonNode, bound: Option<String>) -> Result<Line, ObserveError>
+  intent "Encode one sample with the normalized labels."
+  requires none
+  ensures none
+  effects none
+{
+  let mut nodes = List.new();
+  let mut members = List.new();
+  add_member(&mut nodes, &mut members, "ts", JsonNode.Str(ts.clone()));
+  add_member(&mut nodes, &mut members, "component", JsonNode.Str(metric.component.clone()));
+  add_member(&mut nodes, &mut members, "name", JsonNode.Str(name));
+  add_member(&mut nodes, &mut members, "type", JsonNode.Str(kind));
+  add_member(&mut nodes, &mut members, "value", value);
+  let mut label_fields = List.new();
+  let mut i = 0;
+  while i < metric.labels.len() {
+    match metric.labels.get(i) {
+      Some(entry) => {
+        add_member(&mut nodes, &mut label_fields, entry.key.clone(), JsonNode.Str(entry.value.clone()));
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  add_optional_string(&mut nodes, &mut label_fields, "le", &bound);
+  add_member(&mut nodes, &mut members, "labels", JsonNode.Object(label_fields));
+  let root = nodes.len();
+  nodes.push(JsonNode.Object(members));
+  let encoded = json_bytes(&JsonValue.new(nodes, root))?;
+  return Ok(Line { json_text: utf8(&encoded)? });
+}
+
+fn suffixed(name: &String, suffix: &String) -> Result<String, ObserveError>
+  intent "Join a metric base name and a histogram suffix."
+  requires none
+  ensures none
+  effects none
+{
+  return utf8(&name.as_bytes().concat(&suffix.as_bytes()));
+}
+
+impl Metric {
+  pub fn snapshot(self: &Metric, ts: &String) -> Result<List<Line>, ObserveError>
+    intent "Snapshot one metric as NDJSON samples of the same timestamp."
+    requires none
+    ensures none
+    effects none
+  {
+    if !valid_timestamp(&ts) {
+      return Err(ObserveError.InvalidTimestamp);
+    }
+    let mut lines = List.new();
+    match self.state {
+      Some(MetricState.Counter(value)) => {
+        lines.push(metric_line(&self, &ts, self.name.clone(), "counter", JsonNode.Float(value), None)?);
+      }
+      Some(MetricState.Gauge(value)) => {
+        lines.push(metric_line(&self, &ts, self.name.clone(), "gauge", JsonNode.Float(value), None)?);
+      }
+      Some(MetricState.Histogram(count, sum, buckets)) => {
+        let bucket_name = suffixed(&self.name, &"_bucket")?;
+        let sum_name = suffixed(&self.name, &"_sum")?;
+        let count_name = suffixed(&self.name, &"_count")?;
+        lines.push(metric_line(&self, &ts, count_name, "histogram", JsonNode.Int(count), None)?);
+        lines.push(metric_line(&self, &ts, sum_name, "histogram", JsonNode.Float(sum), None)?);
+        let mut i = 0;
+        while i < buckets.len() {
+          match buckets.get(i) {
+            Some(bucket) => {
+              let bound = utf8(&scalar_bytes(JsonNode.Float(bucket.upper))?)?;
+              lines.push(metric_line(&self, &ts, bucket_name.clone(), "histogram", JsonNode.Int(bucket.count), Some(bound))?);
+            }
+            None => {}
+          }
+          i = i + 1;
+        }
+        lines.push(metric_line(&self, &ts, bucket_name, "histogram", JsonNode.Int(count), Some("+Inf"))?);
+      }
+      None => {
+        return Err(ObserveError.InvalidNumber);
+      }
+    }
+    return Ok(lines);
+  }
+}
