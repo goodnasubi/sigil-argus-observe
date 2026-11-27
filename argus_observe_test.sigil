@@ -81,6 +81,12 @@ fn logs(ts: &String, component: &String) -> Result<Bool, ObserveError>
       return Ok(false);
     }
   }
+  match log_line(&ts, &"sigil-os2", Level.Info, &"", &empty) {
+    Err(ObserveError.InvalidComponent) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
   let bad_trace = log_context(Some("not-hex"), None, None, None, None);
   match log_line(&ts, &component, Level.Info, &"", &bad_trace) {
     Err(ObserveError.InvalidTraceId) => {}
@@ -161,6 +167,12 @@ fn metrics(ts: &String, component: &String) -> Result<Bool, ObserveError>
   }
 
   let empty = List.new();
+  match metric(&"sigil-os2", &"queue_depth", MetricKind.Gauge, &empty) {
+    Err(ObserveError.InvalidComponent) => {}
+    _ => {
+      return Ok(false);
+    }
+  }
   match metric(&component, &"Queue-Depth", MetricKind.Gauge, &empty) {
     Err(ObserveError.InvalidMetricName) => {}
     _ => {
