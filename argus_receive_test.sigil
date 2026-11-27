@@ -1,0 +1,906 @@
+module argus_receive_test
+  targets server
+  trust none
+
+use argus_receive.default_config;
+use argus_receive.listen_on;
+use argus_receive.open_hub;
+use argus_receive.serve;
+use argus_receive.share_hub;
+use argus_receive.with_limits;
+use argus_receive.with_listen;
+use argus_receive.with_query_limits;
+use argus_receive.with_test_clock;
+
+// Loopback integration and defense tests for the receiving port and query API (ADR 0067 decision 7, stage 3).
+// Each scenario starts the server on an ephemeral 127.0.0.1 port in the same program and races a client scenario
+// against it; the server is cancelled when the scenario returns. A scenario returns 0 or a number naming the failed
+// check. ARGUS_TEST_DB names a fresh database path.
+
+struct Reply {
+  status: Int,
+  body: String,
+}
+
+fn has(text: &String, needle: &String) -> Bool
+  intent "Substring test."
+  requires none
+  ensures none
+  effects none
+{
+  let hay = text.as_bytes();
+  let want = needle.as_bytes();
+  let mut i = 0;
+  while i + want.byte_len() <= hay.byte_len() {
+    let mut j = 0;
+    while j < want.byte_len() && hay.get(i + j).unwrap_or(0) == want.get(j).unwrap_or(1) {
+      j = j + 1;
+    }
+    if j == want.byte_len() {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn head_end(buf: &Bytes) -> Int
+  intent "Index of CRLF CRLF or -1."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i + 3 < buf.byte_len() {
+    if buf.get(i).unwrap_or(0) == 13 && buf.get(i + 1).unwrap_or(0) == 10 && buf.get(i + 2).unwrap_or(0) == 13 && buf.get(i + 3).unwrap_or(0) == 10 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn digits(bytes: &Bytes, start: Int) -> Int
+  intent "Parse decimal digits from a position."
+  requires none
+  ensures none
+  effects none
+{
+  let mut value = 0;
+  let mut i = start;
+  while i < bytes.byte_len() {
+    let c = bytes.get(i).unwrap_or(0);
+    if c < 48 || c > 57 {
+      return value;
+    }
+    value = value * 10 + c - 48;
+    i = i + 1;
+  }
+  return value;
+}
+
+fn content_length(head: &Bytes) -> Int
+  intent "Read the Content-Length value of a response head."
+  requires none
+  ensures none
+  effects none
+{
+  let marker = "Content-Length: ".as_bytes();
+  let mut i = 0;
+  while i + marker.byte_len() <= head.byte_len() {
+    let mut j = 0;
+    while j < marker.byte_len() && head.get(i + j).unwrap_or(0) == marker.get(j).unwrap_or(1) {
+      j = j + 1;
+    }
+    if j == marker.byte_len() {
+      return digits(&head, i + j);
+    }
+    i = i + 1;
+  }
+  return 0;
+}
+
+fn open(port: Int) -> Result<TcpClient, Int>
+  intent "Connect to the server."
+  requires none
+  ensures none
+  effects net.client, task.suspend
+{
+  return net.connect(&"127.0.0.1", port).map_err(|error| 9001);
+}
+
+fn read_reply(conn: &mut TcpClient, wait_ms: Int) -> Result<Reply, Int>
+  intent "Read one HTTP response: head, then Content-Length bytes. Err(1) closed or silent, Err(2) malformed."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut buf = Bytes.new();
+  let mut end = head_end(&buf);
+  while end < 0 {
+    let got = task.timeout(wait_ms, || conn.read(4096));
+    match got {
+      None => {
+        return Err(1);
+      }
+      Some(outcome) => {
+        match outcome {
+          Ok(piece) => {
+            if piece.byte_len() == 0 {
+              return Err(1);
+            }
+            buf.extend(&piece);
+          }
+          Err(error) => {
+            return Err(1);
+          }
+        }
+      }
+    }
+    end = head_end(&buf);
+  }
+  let head = buf.slice(0, end).unwrap_or(Bytes.new());
+  let need = content_length(&head);
+  let mut body = buf.slice(end + 4, buf.byte_len()).unwrap_or(Bytes.new());
+  while body.byte_len() < need {
+    let got = task.timeout(wait_ms, || conn.read(65536));
+    match got {
+      Some(Ok(piece)) => {
+        if piece.byte_len() == 0 {
+          return Err(1);
+        }
+        body.extend(&piece);
+      }
+      _ => {
+        return Err(1);
+      }
+    }
+  }
+  return Ok(Reply { status: digits(&head, 9), body: body.to_string_utf8().unwrap_or("") });
+}
+
+fn send_all(conn: &mut TcpClient, data: &Bytes) -> Bool
+  intent "Write all bytes within five seconds."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match task.timeout(5000, || conn.write_all(&data)) {
+    Some(done) => done.is_ok(),
+    None => false,
+  };
+}
+
+fn request_bytes(method: &String, target: &String, body: &Bytes, close: Bool) -> Bytes
+  intent "Build one HTTP/1.1 request."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = method.as_bytes();
+  out.push(32);
+  out.extend(&target.as_bytes());
+  out.extend(&" HTTP/1.1\r\nHost: 127.0.0.1\r\n".as_bytes());
+  if close {
+    out.extend(&"Connection: close\r\n".as_bytes());
+  }
+  out.extend(&"Content-Length: ".as_bytes());
+  let mut length = Bytes.new();
+  match json.stringify(&JsonValue.new(vec_of(JsonNode.Int(body.byte_len())), 0)) {
+    Ok(text) => {
+      length = text;
+    }
+    Err(code) => {}
+  }
+  out.extend(&length);
+  out.extend(&"\r\n\r\n".as_bytes());
+  out.extend(&body);
+  return out;
+}
+
+fn vec_of(node: JsonNode) -> List<JsonNode>
+  intent "A one-element node list."
+  requires none
+  ensures none
+  effects none
+{
+  let mut nodes = List.new();
+  nodes.push(node);
+  return nodes;
+}
+
+fn http(port: Int, method: String, target: String, body: &Bytes) -> Result<Reply, Int>
+  intent "One request on a fresh connection."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = open(port)?;
+  if !send_all(&mut conn, &request_bytes(&method, &target, &body, true)) {
+    return Err(9002);
+  }
+  return read_reply(&mut conn, 60000);
+}
+
+fn post(port: Int, text: &String) -> Result<Reply, Int>
+  intent "POST /ingest."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return http(port, "POST", "/ingest", &text.as_bytes());
+}
+
+fn get(port: Int, target: String) -> Result<Reply, Int>
+  intent "GET a path."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return http(port, "GET", target, &Bytes.new());
+}
+
+fn log_row(ts: &String, component: &String, level: &String, msg: &String) -> String
+  intent "One NDJSON log row."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "{\"ts\":\"".as_bytes();
+  out.extend(&ts.as_bytes());
+  out.extend(&"\",\"component\":\"".as_bytes());
+  out.extend(&component.as_bytes());
+  out.extend(&"\",\"level\":\"".as_bytes());
+  out.extend(&level.as_bytes());
+  out.extend(&"\",\"msg\":\"".as_bytes());
+  out.extend(&msg.as_bytes());
+  out.extend(&"\"}".as_bytes());
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn metric_row(ts: &String, component: &String, name: &String, kind: &String, value: &String) -> String
+  intent "One NDJSON metric row."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "{\"ts\":\"".as_bytes();
+  out.extend(&ts.as_bytes());
+  out.extend(&"\",\"component\":\"".as_bytes());
+  out.extend(&component.as_bytes());
+  out.extend(&"\",\"name\":\"".as_bytes());
+  out.extend(&name.as_bytes());
+  out.extend(&"\",\"type\":\"".as_bytes());
+  out.extend(&kind.as_bytes());
+  out.extend(&"\",\"value\":".as_bytes());
+  out.extend(&value.as_bytes());
+  out.extend(&",\"labels\":{\"queue\":\"jobs\"}}".as_bytes());
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn row_at(rows: &List<String>, index: Int) -> String
+  intent "One row or an empty string."
+  requires none
+  ensures none
+  effects none
+{
+  return match rows.get(index) {
+    Some(row) => row.clone(),
+    None => "",
+  };
+}
+
+fn join(rows: &List<String>) -> String
+  intent "Join rows with LF."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < rows.len() {
+    out.extend(&row_at(&rows, i).as_bytes());
+    out.push(10);
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn expect(reply: Result<Reply, Int>, status: Int, needle: &String, code: Int) -> Int
+  intent "Check a reply's status and one body fragment; returns 0 or code."
+  requires none
+  ensures none
+  effects none
+{
+  match reply {
+    Ok(found) => {
+      if found.status == status && has(&found.body, &needle) {
+        return 0;
+      }
+      return code;
+    }
+    Err(failure) => {
+      return code;
+    }
+  }
+}
+
+fn flow_basics(port: Int, cell: Atomic<Int>) -> Int
+  intent "Ingest logs, metrics and heartbeats over HTTP and read them back through the query API."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  let mut rows = List.new();
+  rows.push(log_row(&"2026-11-27T10:00:00.000Z", &"sigil-alpha", &"INFO", &"boot ok"));
+  rows.push(log_row(&"2026-11-27T10:00:01.000Z", &"sigil-alpha", &"WARN", &"disk slow"));
+  rows.push(log_row(&"2026-11-27T10:00:02.000Z", &"sigil-beta", &"ERROR", &"boot failed"));
+  rows.push(metric_row(&"2026-11-27T10:00:00.000Z", &"sigil-alpha", &"queue_depth", &"gauge", &"4"));
+  rows.push(metric_row(&"2026-11-27T10:00:01.000Z", &"sigil-alpha", &"queue_depth", &"gauge", &"10"));
+  rows.push(metric_row(&"2026-11-27T10:00:02.000Z", &"sigil-alpha", &"queue_depth", &"gauge", &"1.5"));
+  rows.push(metric_row(&"2026-11-27T10:00:00.000Z", &"sigil-worker", &"heartbeat_ping", &"counter", &"1"));
+  let mut code = expect(post(port, &join(&rows)), 200, &"\"accepted\":7,\"rejected\":0", 101);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/healthz"), 200, &"ok", 102);
+  if code != 0 {
+    return code;
+  }
+  // Newest first; filters by component, level and message prefix; limit.
+  code = expect(get(port, "/api/logs?component=sigil-alpha"), 200, &"\"count\":2", 103);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/logs?level=ERROR"), 200, &"boot failed", 104);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/logs?prefix=disk"), 200, &"\"count\":1", 105);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/logs?limit=1"), 200, &"boot failed", 106);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/logs?since=2026-11-27T10:00:01.000Z&until=2026-11-27T10:00:01.999Z"), 200, &"disk slow", 107);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/metrics?component=sigil-alpha&name=queue_depth"), 200, &"\"samples\":3,\"sum\":15.5,\"min\":1.5,\"max\":10.0,\"last\":1.5", 108);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/metrics?component=sigil-alpha&name=queue_depth&since=2026-11-27T10:00:01.000Z"), 200, &"\"samples\":2", 109);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/metrics?name=queue_depth"), 400, &"error", 110);
+  if code != 0 {
+    return code;
+  }
+  // Heartbeat state follows the clock: healthy, dead after 30 s of silence, healthy again after a new ping.
+  code = expect(get(port, "/api/components"), 200, &"\"component\":\"sigil-worker\",\"status\":\"healthy\"", 111);
+  if code != 0 {
+    return code;
+  }
+  cell.store(cell.load() + 30000);
+  code = expect(get(port, "/api/components"), 200, &"\"status\":\"dead\"", 112);
+  if code != 0 {
+    return code;
+  }
+  code = expect(post(port, &metric_row(&"2026-11-27T10:00:31.000Z", &"sigil-worker", &"heartbeat_ping", &"counter", &"2")), 200, &"\"accepted\":1", 113);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/components"), 200, &"\"status\":\"healthy\"", 114);
+  if code != 0 {
+    return code;
+  }
+  // Rejections: bad rows are counted with a reason, good rows in the same body are stored, a replay is a duplicate.
+  let mut mixed = List.new();
+  mixed.push(log_row(&"2026-11-27T10:01:00.000Z", &"Sigil_Bad", &"INFO", &"bad component"));
+  mixed.push(log_row(&"2026-11-27T10:01:01.000Z", &"sigil-alpha", &"LOUD", &"bad level"));
+  mixed.push(log_row(&"2026-11-27T10:01:02.000Z", &"sigil-alpha", &"INFO", &"fine"));
+  mixed.push("not json");
+  code = expect(post(port, &join(&mixed)), 200, &"\"accepted\":1,\"rejected\":3", 115);
+  if code != 0 {
+    return code;
+  }
+  code = expect(post(port, &metric_row(&"2026-11-27T10:00:00.000Z", &"sigil-alpha", &"queue_depth", &"gauge", &"4")), 200, &"\"accepted\":0,\"rejected\":1", 116);
+  if code != 0 {
+    return code;
+  }
+  code = expect(get(port, "/api/nothing"), 404, &"error", 117);
+  if code != 0 {
+    return code;
+  }
+  code = expect(http(port, "PUT", "/ingest", &Bytes.new()), 405, &"error", 118);
+  if code != 0 {
+    return code;
+  }
+  return expect(get(port, "/ingest"), 405, &"error", 119);
+}
+
+fn raw_flow(port: Int) -> Result<Int, Int>
+  intent "Send NDJSON over a raw TCP connection and read one reply line per record."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = open(port)?;
+  let mut rows = List.new();
+  rows.push(log_row(&"2026-11-27T11:00:00.000Z", &"sigil-raw", &"INFO", &"first"));
+  rows.push(log_row(&"2026-11-27T11:00:01.000Z", &"Sigil-Raw", &"INFO", &"bad"));
+  rows.push(metric_row(&"2026-11-27T11:00:00.000Z", &"sigil-raw", &"jobs_total", &"counter", &"3"));
+  rows.push(metric_row(&"2026-11-27T11:00:00.000Z", &"sigil-raw", &"jobs_total", &"counter", &"3"));
+  if !send_all(&mut conn, &join(&rows).as_bytes()) {
+    return Err(201);
+  }
+  let mut replies = Bytes.new();
+  while !has(&replies.to_string_utf8().unwrap_or(""), &"ERR duplicate\n") {
+    match task.timeout(60000, || conn.read(4096)) {
+      Some(Ok(piece)) => {
+        if piece.byte_len() == 0 {
+          return Err(202);
+        }
+        replies.extend(&piece);
+      }
+      Some(Err(error)) => {
+        return Err(213);
+      }
+      None => {
+        return Err(203);
+      }
+    }
+  }
+  let text = replies.to_string_utf8().unwrap_or("");
+  if !has(&text, &"OK\nERR invalid_component\nOK\nERR duplicate\n") {
+    return Err(204);
+  }
+  let mut code = expect(get(port, "/api/logs?component=sigil-raw"), 200, &"\"count\":1", 205);
+  if code != 0 {
+    return Err(code);
+  }
+  code = expect(get(port, "/api/metrics?component=sigil-raw&name=jobs_total"), 200, &"\"samples\":1", 206);
+  if code != 0 {
+    return Err(code);
+  }
+  return Ok(0);
+}
+
+fn flow_raw(port: Int) -> Int
+  intent "Raw TCP NDJSON scenario as a plain code."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match raw_flow(port) {
+    Ok(code) => code,
+    Err(code) => code,
+  };
+}
+
+fn repeated(byte: Int, count: Int) -> Bytes
+  intent "count copies of one byte."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(count);
+  let mut i = 0;
+  while i < count {
+    out.push(byte);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn raw_request(port: Int, data: &Bytes) -> Result<Reply, Int>
+  intent "Send arbitrary bytes on a fresh connection and read one HTTP reply."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = open(port)?;
+  if !send_all(&mut conn, &data) {
+    return Err(9002);
+  }
+  return read_reply(&mut conn, 60000);
+}
+
+fn defense_http(port: Int) -> Int
+  intent "Oversized, malformed and unsupported HTTP requests are refused with the right status."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  // Body larger than the configured 200,000 bytes: answered 413 from the header alone, body never read.
+  let big = "POST /ingest HTTP/1.1\r\nContent-Length: 300000\r\n\r\n".as_bytes();
+  let mut code = expect(raw_request(port, &big), 413, &"error", 401);
+  if code != 0 {
+    return code;
+  }
+  let mut huge_head = "GET /healthz HTTP/1.1\r\nX-Pad: ".as_bytes();
+  huge_head.extend(&repeated(97, 9000));
+  huge_head.extend(&"\r\n\r\n".as_bytes());
+  code = expect(raw_request(port, &huge_head), 431, &"error", 402);
+  if code != 0 {
+    return code;
+  }
+  code = expect(raw_request(port, &"POST /ingest HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".as_bytes()), 501, &"error", 403);
+  if code != 0 {
+    return code;
+  }
+  code = expect(raw_request(port, &"GET /healthz HTTP/2.0\r\n\r\n".as_bytes()), 505, &"error", 404);
+  if code != 0 {
+    return code;
+  }
+  code = expect(raw_request(port, &"GARBAGE\r\n\r\n".as_bytes()), 400, &"error", 405);
+  if code != 0 {
+    return code;
+  }
+  code = expect(raw_request(port, &"POST /ingest HTTP/1.1\r\nContent-Length: abc\r\n\r\n".as_bytes()), 400, &"error", 406);
+  if code != 0 {
+    return code;
+  }
+  // One 64 KB+ record is rejected on its own; its neighbour is stored.
+  let mut rows = List.new();
+  let long_msg = repeated(97, 70000).to_string_utf8().unwrap_or("");
+  rows.push(log_row(&"2026-11-27T12:00:00.000Z", &"sigil-big", &"INFO", &long_msg));
+  rows.push(log_row(&"2026-11-27T12:00:01.000Z", &"sigil-big", &"INFO", &"small"));
+  code = expect(post(port, &join(&rows)), 200, &"\"accepted\":1,\"rejected\":1,\"reasons\":[\"line_too_large\"]", 407);
+  if code != 0 {
+    return code;
+  }
+  // A record at the limit's edge is truncated by the emitter, not by the receiver: 60,000 bytes pass whole.
+  let mut edge = List.new();
+  edge.push(log_row(&"2026-11-27T12:00:02.000Z", &"sigil-big", &"INFO", &repeated(98, 60000).to_string_utf8().unwrap_or("")));
+  code = expect(post(port, &join(&edge)), 200, &"\"accepted\":1", 408);
+  if code != 0 {
+    return code;
+  }
+  // The server is still serving.
+  return expect(get(port, "/api/logs?component=sigil-big&prefix=small"), 200, &"\"count\":1", 409);
+}
+
+fn defense_raw(port: Int) -> Result<Int, Int>
+  intent "A raw TCP line over 64 KB is refused and the connection is closed."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = open(port)?;
+  let mut line = "{\"ts\":\"".as_bytes();
+  line.extend(&repeated(97, 70000));
+  if !send_all(&mut conn, &line) {
+    return Err(411);
+  }
+  let mut seen = Bytes.new();
+  let mut closed = false;
+  while !closed && seen.byte_len() < 64 {
+    match task.timeout(3000, || conn.read(256)) {
+      Some(Ok(piece)) => {
+        if piece.byte_len() == 0 {
+          closed = true;
+        } else {
+          seen.extend(&piece);
+        }
+      }
+      _ => {
+        closed = true;
+      }
+    }
+  }
+  if !has(&seen.to_string_utf8().unwrap_or(""), &"ERR line_too_large\n") {
+    return Err(412);
+  }
+  return Ok(0);
+}
+
+fn defense_flow_raw(port: Int) -> Int
+  intent "Raw over-long line scenario as a plain code."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match defense_raw(port) {
+    Ok(code) => code,
+    Err(code) => code,
+  };
+}
+
+fn goes_silent(port: Int, data: &Bytes, wait_ms: Int) -> Result<Bool, Int>
+  intent "Send a partial request and report whether the server closes the connection within wait_ms."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut conn = open(port)?;
+  if data.byte_len() > 0 && !send_all(&mut conn, &data) {
+    return Err(421);
+  }
+  return match task.timeout(wait_ms, || conn.read(256)) {
+    Some(Ok(piece)) => Ok(piece.byte_len() == 0),
+    Some(Err(error)) => Ok(true),
+    None => Ok(false),
+  };
+}
+
+fn defense_slow(port: Int) -> Int
+  intent "Idle and dribbling connections are cut at the I/O deadline (300 ms in this scenario)."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut partial = List.new();
+  partial.push("".as_bytes());
+  partial.push("POST /ingest HTTP/1.1\r\nContent-Le".as_bytes());
+  partial.push("POST /ingest HTTP/1.1\r\nContent-Length: 50\r\n\r\n{\"ts\"".as_bytes());
+  partial.push("{\"ts\":\"2026".as_bytes());
+  let mut i = 0;
+  while i < partial.len() {
+    let data = match partial.get(i) {
+      Some(item) => item.clone(),
+      None => Bytes.new(),
+    };
+    match goes_silent(port, &data, 3000) {
+      Ok(closed) => {
+        if !closed {
+          return 431 + i;
+        }
+      }
+      Err(failure) => {
+        return failure;
+      }
+    }
+    i = i + 1;
+  }
+  return expect(get(port, "/healthz"), 200, &"ok", 440);
+}
+
+fn defense_connections(port: Int) -> Result<Int, Int>
+  intent "With two connection slots, a third connection is not served until a slot frees up."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  let mut first = open(port)?;
+  let mut second = open(port)?;
+  let ping = request_bytes(&"GET", &"/healthz", &Bytes.new(), false);
+  if !send_all(&mut first, &ping) || !send_all(&mut second, &ping) {
+    return Err(451);
+  }
+  if read_reply(&mut first, 3000).is_err() || read_reply(&mut second, 3000).is_err() {
+    return Err(452);
+  }
+  let mut third = open(port)?;
+  if !send_all(&mut third, &ping) {
+    return Err(453);
+  }
+  // Both slots are held by idle keep-alive connections: the third request waits.
+  if read_reply(&mut third, 400).is_ok() {
+    return Err(454);
+  }
+  // The idle connections expire after the 1,500 ms deadline; the waiting request is then answered.
+  match read_reply(&mut third, 5000) {
+    Ok(reply) => {
+      if reply.status != 200 {
+        return Err(455);
+      }
+    }
+    Err(code) => {
+      return Err(456);
+    }
+  }
+  return Ok(0);
+}
+
+fn defense_cap(port: Int) -> Int
+  intent "Connection cap scenario as a plain code."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match defense_connections(port) {
+    Ok(code) => code,
+    Err(code) => code,
+  };
+}
+
+fn defense_flood(port: Int) -> Result<Int, Int>
+  intent "Per-connection request cap, rapid reconnects, clamped query size and bounded scans."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  // The fifth request on a connection is answered with Connection: close; a sixth gets nothing.
+  let mut conn = open(port)?;
+  let ping = request_bytes(&"GET", &"/healthz", &Bytes.new(), false);
+  let mut n = 0;
+  while n < 5 {
+    if !send_all(&mut conn, &ping) {
+      return Err(461);
+    }
+    match read_reply(&mut conn, 3000) {
+      Ok(reply) => {
+        if reply.status != 200 {
+          return Err(462);
+        }
+      }
+      Err(code) => {
+        return Err(463);
+      }
+    }
+    n = n + 1;
+  }
+  let sent = send_all(&mut conn, &ping);
+  if sent && read_reply(&mut conn, 1000).is_ok() {
+    return Err(464);
+  }
+  // A burst of reconnects is served in full.
+  let mut burst = 0;
+  while burst < 150 {
+    match get(port, "/healthz") {
+      Ok(reply) => {
+        if reply.status != 200 {
+          return Err(465);
+        }
+      }
+      Err(code) => {
+        return Err(466);
+      }
+    }
+    burst = burst + 1;
+  }
+  // Query result size is clamped to the configured 3 records however large a limit is asked for.
+  let mut rows = List.new();
+  let mut k = 0;
+  while k < 6 {
+    let mut ts = "2026-11-27T13:00:0".as_bytes();
+    ts.push(48 + k);
+    ts.extend(&".000Z".as_bytes());
+    rows.push(log_row(&ts.to_string_utf8().unwrap_or(""), &"sigil-flood", &"INFO", &"row"));
+    rows.push(metric_row(&ts.to_string_utf8().unwrap_or(""), &"sigil-flood", &"load_ratio", &"gauge", &"1"));
+    k = k + 1;
+  }
+  let stored = expect(post(port, &join(&rows)), 200, &"\"accepted\":12", 467);
+  if stored != 0 {
+    return Err(stored);
+  }
+  let clamp = expect(get(port, "/api/logs?limit=100000"), 200, &"\"count\":3", 468);
+  if clamp != 0 {
+    return Err(clamp);
+  }
+  // Scanning is bounded too: 4 of the 6 stored samples are looked at and the answer says it is incomplete.
+  let scan = expect(get(port, "/api/metrics?component=sigil-flood&name=load_ratio"), 200, &"\"scanned\":4", 469);
+  if scan != 0 {
+    return Err(scan);
+  }
+  return Ok(expect(get(port, "/api/metrics?component=sigil-flood&name=load_ratio"), 200, &"\"complete\":false", 470));
+}
+
+fn defense_flood_code(port: Int) -> Int
+  intent "Flood scenario as a plain code."
+  requires none
+  ensures none
+  effects clock, net.client, task.spawn, task.suspend
+{
+  return match defense_flood(port) {
+    Ok(code) => code,
+    Err(code) => code,
+  };
+}
+
+fn scenario(port: Int, which: Int, cell: Atomic<Int>) -> Int
+  intent "Run client scenario number which."
+  requires none
+  ensures none
+  effects clock, net.client, task
+{
+  if which == 1 {
+    return flow_basics(port, cell);
+  }
+  if which == 2 {
+    return flow_raw(port);
+  }
+  if which == 3 {
+    return defense_http(port);
+  }
+  if which == 4 {
+    return defense_flow_raw(port);
+  }
+  if which == 5 {
+    return defense_slow(port);
+  }
+  if which == 6 {
+    return defense_cap(port);
+  }
+  return defense_flood_code(port);
+}
+
+fn db_path(which: Int) -> String
+  intent "A per-scenario database path under ARGUS_TEST_DB."
+  requires none
+  ensures none
+  effects env
+{
+  let base = env.get(&"ARGUS_TEST_DB").unwrap_or("");
+  if base == "" {
+    return "";
+  }
+  let mut path = base.as_bytes();
+  path.extend(&"-scenario-".as_bytes());
+  path.push(48 + which);
+  return path.to_string_utf8().unwrap_or("");
+}
+
+fn harness(which: Int, max_connections: Int, io_timeout_ms: Int, max_requests: Int, query_max: Int, scan_limit: Int) -> Int
+  intent "Start the server on an ephemeral loopback port, run one scenario against it, then cancel the server."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  let path = db_path(which);
+  if path == "" {
+    return 8003;
+  }
+  let cell = Atomic.new(1000000);
+  let config = with_test_clock(with_query_limits(with_limits(with_listen(default_config(path), "127.0.0.1", 0), max_connections, io_timeout_ms, 200000, max_requests), query_max, scan_limit), cell.clone());
+  match open_hub(config) {
+    Ok(hub) => {
+      match listen_on(&hub.config) {
+        Ok(listener) => {
+          let port = listener.local_port();
+          let shared = share_hub(hub);
+          let mut gs = List.new();
+          gs.push(move || scenario(port, which, cell.clone()));
+          gs.push(move || serve(&listener, &shared));
+          return task.race(gs);
+        }
+        Err(error) => {
+          return 8001;
+        }
+      }
+    }
+    Err(error) => {
+      return 8002;
+    }
+  }
+}
+
+pub fn run(which: Int) -> Int
+  intent "Run scenario which (1 HTTP flow, 2 raw TCP flow, 3 HTTP defense, 4 raw over-long line, 5 slow clients, 6 connection cap, 7 flood and bounds)."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  if which == 5 {
+    return harness(5, 8, 300, 1000, 500, 5000);
+  }
+  if which == 6 {
+    return harness(6, 2, 1500, 1000, 500, 5000);
+  }
+  if which == 7 {
+    return harness(7, 64, 5000, 5, 3, 4);
+  }
+  return harness(which, 8, 10000, 1000, 500, 5000);
+}
+
+pub fn main() -> Int
+  intent "Run every scenario and return the first failure code, or 0."
+  requires none
+  ensures none
+  effects clock, env, fs, net.server, task
+{
+  let mut which = 1;
+  while which <= 7 {
+    let outcome = run(which);
+    if outcome != 0 {
+      return which * 1000 + outcome;
+    }
+    which = which + 1;
+  }
+  return 0;
+}

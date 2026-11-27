@@ -12,7 +12,7 @@ jobs:
   sigil:
     name: Sigil validation
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -24,6 +24,14 @@ jobs:
           repository: goodnasubi/sigil
           ref: 60cc4f9acf2e7c7a69cec1c60af5e2e4515ac71a
           path: .sigil-compiler
+          persist-credentials: false
+
+      - name: Check out the pinned sigil-db core
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: goodnasubi/sigil-db
+          ref: 9483e36f08c35bfc62b3beeb008a531887506037
+          path: .sigil-db
           persist-credentials: false
 
       - name: Install native build prerequisites
@@ -40,3 +48,8 @@ jobs:
 
       - name: Run emitter tests (sigil fmt, check, run, build)
         run: python3 tests/check_emitter.py
+
+      - name: Run receiving port and query API tests (stage 3)
+        env:
+          SIGIL_DB: ${{ github.workspace }}/.sigil-db
+        run: python3 tests/check_stage3.py

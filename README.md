@@ -28,6 +28,21 @@ Sigil サービス向けのログ・メトリクス収集と死活監視のラ�
 - `default_pull()` で初回は即時、以降は開始時刻から 10 秒間隔です。`poll(&Probe.Http(host, port), now_ms)` は平文 HTTP/1.x の `GET /healthz` に対する 2xx を成功とします。`Probe.Tcp(host, port)` は接続成功で判定します。`host` は数値 IPv4 または IPv6 アドレスです。既定の 3 秒は接続・送信・応答に共通の期限です。連続失敗中は `Degraded`、3 回目で `Dead`（ADR のプル型異常判定）、成功時に `Healthy` に復旧します。
 - `default_heartbeat(now_ms)` で受信猶予を開始します。ハートビート受信時に `ping(now_ms)` を呼び、`status(now_ms)` で状態を取得します。最後の受信から 30 秒で `Dead` になり、次の受信で `Healthy` に復旧します。
 
+## 受信口とクエリ API（第3段）
+
+`argus_receive.sigil` が 1 つの待ち受けポートでログ・メトリクスを受信し、`sigil-orchestra` のダッシュボードへデータを提供します。既定は `127.0.0.1:7490` です。受け取った行は `argus_observe.accept_line` で検証・正規化（component の正規化、ラベル数上限 10 個、1 行 64 KB 上限）してから、第2段の保存コアに書き込みます。
+
+`argus_receive.default_config(db_path)`、`open_hub`、`listen_on`、`share_hub`、`serve` で起動します。データベースは `sigil-db` の `db_path` です。接続数・期限・本文・要求数の上限は `with_limits`、クエリの大きさは `with_query_limits` で設定します。
+
+- **HTTP/1.1**（先頭が `{` 以外）: `POST /ingest` は NDJSON を受け取り `{"accepted":N,"rejected":M,"reasons":[…]}` を返します。無効な行は理由付きで数え、有効な行は保存します。同じメトリクス標本の再送は `rejected` に数えます。`GET /healthz`。
+- **生 TCP**（先頭が `{`）: 1 行 1 レコードを送ると、1 行ごとに `OK` または `ERR <理由>` が返ります。64 KB を超える行は `ERR line_too_large` の後に切断します。
+- **クエリ API**（`GET`、JSON）:
+  - `/api/logs?component=&level=&since=&until=&prefix=&limit=` は直近のログを新しい順に返します。`prefix` は `msg` の前方一致です。
+  - `/api/metrics?component=&name=&since=&until=` は件数・合計・最小・最大・最新値を返します。`complete` が `false` なら走査上限で打ち切っています。
+  - `/api/components` は `heartbeat_ping` を送ってきた部品の状態（`healthy` / `degraded` / `dead`）を返します。30 秒受信が途絶えると `dead` です。
+
+DoS 防御の境界: 同時接続数（既定 64）、要求ヘッド 8 KB、本文（既定 1 MiB）、1 接続あたりの要求数（既定 1,000）、要求全体の入出力期限（既定 10 秒）、1 回のログ件数（既定上限 500）と走査行数（既定 5,000）。上限を超える要求は 413・431・501・505・400 などで拒否します。流量制御（レートリミット）とデータ保持ローテーションは第4段の範囲です。プル型の死活監視（`Probe`）をこのサーバーで定期実行する仕組みも本段には含めません。
+
 ## 検証
 
 Linux x86-64 で Sigil の `60cc4f9acf2e7c7a69cec1c60af5e2e4515ac71a` を使用します。Sigil のチェックアウトで `cargo build --locked --bin sigil` を実行し、このリポジトリで次を実行します。
@@ -47,3 +62,11 @@ SIGIL=/path/to/sigil/target/debug/sigil SIGIL_DB=/path/to/sigil-db python3 tests
 ```
 
 モック時計で期限の境界と復旧を、ループバックで HTTP/TCP の接続と応答タイムアウトを確認します。保存テストでは混在バッチのロールバックと WAL からの再オープン、最大サイズのログの復元を確認します。
+
+第3段の検証では、第2段と同じ `SIGIL` と `SIGIL_DB` を指定します。
+
+```sh
+SIGIL=/path/to/sigil/target/debug/sigil SIGIL_DB=/path/to/sigil-db python3 tests/check_stage3.py
+```
+
+`argus_accept_test.sigil` は受信行の検証を、`argus_receive_test.sigil` はループバックでサーバーとクライアントを同一プログラムで動かし、HTTP と生 TCP の取り込み、3 種のクエリ、heartbeat の状態遷移、不正・過大・低速・過剰接続・高頻度の各境界を評価器とネイティブの両方で確認します。評価器ではコミットが遅いため、評価器の実行に数分かかります。
