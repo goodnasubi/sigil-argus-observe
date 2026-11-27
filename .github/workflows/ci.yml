@@ -53,3 +53,8 @@ jobs:
         env:
           SIGIL_DB: ${{ github.workspace }}/.sigil-db
         run: python3 tests/check_stage3.py
+
+      - name: Run rotation, rate limiting and load boundary tests (stage 4)
+        env:
+          SIGIL_DB: ${{ github.workspace }}/.sigil-db
+        run: python3 tests/check_stage4.py

@@ -41,7 +41,21 @@ Sigil サービス向けのログ・メトリクス収集と死活監視のラ�
   - `/api/metrics?component=&name=&since=&until=` は件数・合計・最小・最大・最新値を返します。`complete` が `false` なら走査上限で打ち切っています。
   - `/api/components` は `heartbeat_ping` を送ってきた部品の状態（`healthy` / `degraded` / `dead`）を返します。30 秒受信が途絶えると `dead` です。
 
-DoS 防御の境界: 同時接続数（既定 64）、要求ヘッド 8 KB、本文（既定 1 MiB）、1 接続あたりの要求数（既定 1,000）、要求全体の入出力期限（既定 10 秒）、1 回のログ件数（既定上限 500）と走査行数（既定 5,000）。上限を超える要求は 413・431・501・505・400 などで拒否します。流量制御（レートリミット）とデータ保持ローテーションは第4段の範囲です。プル型の死活監視（`Probe`）をこのサーバーで定期実行する仕組みも本段には含めません。
+## データ保持ローテーション・流量制御・負荷境界（第4段）
+
+ADR 0067 決定 7 に基づき、ディスク容量上限（既定 10 GB）および保持期間（既定 7 日）の FIFO ローテーション・削除、高頻度ログ流入時の流量制御（レートリミット）、負荷境界の防御挙動を提供します。
+
+- **保持期間（retention）と容量上限（max_disk_bytes）**:
+  - `with_retention(config, retention_ms, max_disk_bytes)` で設定します。既定は保持期間 7 日（`604,800,000` ms）、容量上限 10 GB（`10,737,418,240` バイト）です。
+  - 上限超過時は古いログから FIFO で自動破棄（`prune_oldest_logs`）し、稼働継続を最優先します（ADR 0067「適合の限界: データ破棄の許容」）。
+  - 保持期限切れのログは `prune_expired_logs` によりタイムスタンプ基準で自動削除されます。
+- **流量制御（レートリミット）**:
+  - `with_rate_limit(config, max_rate)` で 1 秒あたりの最大受信レコード数を設定します（既定 10,000 件/秒）。
+  - 超過時、HTTP は `429 Too Many Requests`（`{"error":"rate_limited"}`）、生 TCP は `ERR rate_limited\n` を即座に返し、次の一秒窓で回復します。
+- **負荷境界**:
+  - `scan_limit` 到達時の打ち切り（`/api/metrics` で `complete: false`、`scanned: N`）。
+  - `query_max` による上限クランプ（`/api/logs` の `limit` 制限）。
+  - 要求本文上限超過（413 Payload Too Large）、要求ヘッダー上限超過（431 Request Header Fields Too Large）、生 TCP の 1 行 64 KB 上限超過（`ERR line_too_large` 切断）。
 
 ## 検証
 
@@ -70,3 +84,12 @@ SIGIL=/path/to/sigil/target/debug/sigil SIGIL_DB=/path/to/sigil-db python3 tests
 ```
 
 `argus_accept_test.sigil` は受信行の検証を、`argus_receive_test.sigil` はループバックでサーバーとクライアントを同一プログラムで動かし、HTTP と生 TCP の取り込み、3 種のクエリ、heartbeat の状態遷移、不正・過大・低速・過剰接続・高頻度の各境界を評価器とネイティブの両方で確認します。評価器ではコミットが遅いため、評価器の実行に数分かかります。
+
+第4段の検証では、第3段と同じ `SIGIL` と `SIGIL_DB` を指定します。
+
+```sh
+SIGIL=/path/to/sigil/target/debug/sigil SIGIL_DB=/path/to/sigil-db python3 tests/check_stage4.py
+```
+
+`argus_stage4_test.sigil` は、容量超過時の FIFO ローテーション、保持期間超過ログの破棄、HTTP/生 TCP の流量制御（429 / ERR rate_limited）と回復、メトリクス走査上限（complete: false）、クエリ上限クランプ、413/431/64 KB 超過の各境界を評価器とネイティブの両方で確認します。
+

@@ -14,6 +14,8 @@ use db.relation.ScanOrder;
 use db.relation.column;
 use db.relation.rel_create_index;
 use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_get;
 use db.relation.rel_insert;
 use db.relation.rel_scan;
 use db.relation.rel_table_exists;
@@ -406,4 +408,150 @@ impl Batch {
       }
     }
   }
+}
+
+pub fn delete_log(database: &Database, tx: &mut Tx, id: Int, chunks: Int) -> Result<Int, DbError>
+  intent "Delete one log record and its payload chunks; returns bytes freed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut payload_key = Bytes.new();
+  encode_value(&Value.IntVal(id), &mut payload_key);
+  let mut freed = 0;
+  let mut c = 0;
+  while c < chunks {
+    let mut chunk_key = payload_key.clone();
+    chunk_key.push_u64_be(c);
+    match rel_get(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key.clone()))? {
+      Some(row) => {
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            freed = freed + bytes.byte_len();
+          }
+          _ => {
+            freed = freed + 4000;
+          }
+        }
+      }
+      None => {}
+    }
+    let _ = rel_delete(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key));
+    c = c + 1;
+  }
+  rel_delete(&database, &mut tx, &"argus_logs", &Value.IntVal(id))?;
+  if freed == 0 {
+    freed = 100;
+  }
+  return Ok(freed);
+}
+
+pub fn prune_oldest_logs(database: &Database, tx: &mut Tx, target_bytes_to_free: Int) -> Result<Int, DbError>
+  intent "Drop oldest logs FIFO until target_bytes_to_free is reached or no more logs."
+  requires none
+  ensures none
+  effects fs
+{
+  if target_bytes_to_free <= 0 {
+    return Ok(0);
+  }
+  let mut total_freed = 0;
+  let mut empty_scan = false;
+  while total_freed < target_bytes_to_free && !empty_scan {
+    let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 50)?;
+    if rows.len() == 0 {
+      empty_scan = true;
+    } else {
+      let mut i = 0;
+      let mut deleted_in_batch = 0;
+      while i < rows.len() && total_freed < target_bytes_to_free {
+        match rows.get(i) {
+          Some(row) => {
+            let id = match row.get(0) {
+              Some(Value.IntVal(num)) => num + 0,
+              _ => 0,
+            };
+            let chunks = match row.get(4) {
+              Some(Value.IntVal(num)) => num + 0,
+              _ => 0,
+            };
+            if id > 0 {
+              let freed = delete_log(&database, &mut tx, id, chunks)?;
+              total_freed = total_freed + freed;
+              deleted_in_batch = deleted_in_batch + 1;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if deleted_in_batch == 0 {
+        empty_scan = true;
+      }
+    }
+  }
+  return Ok(total_freed);
+}
+
+pub fn prune_expired_logs(database: &Database, tx: &mut Tx, cutoff_ts: &String, max_count: Int) -> Result<Int, DbError>
+  intent "Drop logs with ts strictly earlier than cutoff_ts."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut deleted_count = 0;
+  let cutoff_bytes = cutoff_ts.as_bytes();
+  let mut stopped = false;
+  while deleted_count < max_count && !stopped {
+    let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 50)?;
+    if rows.len() == 0 {
+      stopped = true;
+    } else {
+      let mut batch_deleted = 0;
+      let mut i = 0;
+      while i < rows.len() && deleted_count < max_count {
+        match rows.get(i) {
+          Some(row) => {
+            let ts = match row.get(1) {
+              Some(Value.StrVal(text)) => text.clone(),
+              _ => "",
+            };
+            if compare_bytes(&ts.as_bytes(), &cutoff_bytes) < 0 {
+              let id = match row.get(0) {
+                Some(Value.IntVal(num)) => num + 0,
+                _ => 0,
+              };
+              let chunks = match row.get(4) {
+                Some(Value.IntVal(num)) => num + 0,
+                _ => 0,
+              };
+              if id > 0 {
+                let _ = delete_log(&database, &mut tx, id, chunks)?;
+                deleted_count = deleted_count + 1;
+                batch_deleted = batch_deleted + 1;
+              }
+            } else {
+              stopped = true;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if batch_deleted == 0 {
+        stopped = true;
+      }
+    }
+  }
+  return Ok(deleted_count);
+}
+
+pub fn count_logs(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "Count the total committed log rows."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 1000000)?;
+  return Ok(rows.len());
 }
