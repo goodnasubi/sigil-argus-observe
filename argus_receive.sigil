@@ -6,6 +6,7 @@ use argus_collect.batch;
 use argus_collect.initialize;
 use argus_collect.prune_expired_logs;
 use argus_collect.prune_oldest_logs;
+use argus_collect.prune_oldest_metrics;
 use argus_health.Health;
 use argus_health.Heartbeat;
 use argus_health.default_heartbeat;
@@ -222,22 +223,23 @@ fn state_time(inner: &mut State, observed: Int) -> Int
 }
 
 fn initial_stored_log_bytes(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
-  intent "Count initial stored payload bytes from existing logs."
+  intent "Count initial stored payload bytes from existing payload chunks."
   requires none
   ensures none
   effects fs
 {
-  let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 10000)?;
+  let rows = rel_scan(&database, &mut tx, &"argus_payloads", &None, &None, &ScanOrder.Asc, -1)?;
   let mut total = 0;
   let mut i = 0;
   while i < rows.len() {
     match rows.get(i) {
       Some(row) => {
-        let chunks = match row.get(4) {
-          Some(Value.IntVal(c)) => c + 0,
-          _ => 0,
-        };
-        total = total + chunks * 4000;
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            total = total + bytes.byte_len();
+          }
+          _ => {}
+        }
       }
       None => {}
     }
@@ -588,6 +590,34 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
   if !check_rate_limit(&mut inner, &config, lines.len(), now) {
     return Err(DbError.Limit("rate_limited"));
   }
+
+  // Retention pruning: discard logs older than retention_ms and subtract freed bytes upon commit
+  if config.retention_ms > 0 && now > config.retention_ms {
+    let cutoff_ms = now - config.retention_ms;
+    let cutoff_ts = format_iso_timestamp(cutoff_ms);
+    let mut tx = begin_tx(&mut inner.database)?;
+    let pruned_res = prune_expired_logs(&inner.database, &mut tx, &cutoff_ts, 100);
+    match pruned_res {
+      Ok(freed) => {
+        match tx_commit(&mut tx, &mut inner.database) {
+          Ok(_) => {
+            if freed > inner.stored_bytes {
+              inner.stored_bytes = 0;
+            } else {
+              inner.stored_bytes = inner.stored_bytes - freed;
+            }
+          }
+          Err(_) => {
+            let _ = tx_rollback(&mut tx, &mut inner.database);
+          }
+        }
+      }
+      Err(_) => {
+        let _ = tx_rollback(&mut tx, &mut inner.database);
+      }
+    }
+  }
+
   let mut added_bytes = 0;
   let mut pending = batch(lines.len() * 65536 + 1)?;
   let mut i = 0;
@@ -601,6 +631,37 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     }
     i = i + 1;
   }
+
+  // Capacity FIFO rotation: discard oldest logs and metrics when stored_bytes + added_bytes exceeds max_disk_bytes
+  if config.max_disk_bytes > 0 && inner.stored_bytes + added_bytes > config.max_disk_bytes {
+    let excess = inner.stored_bytes + added_bytes - config.max_disk_bytes;
+    let mut tx = begin_tx(&mut inner.database)?;
+    let mut freed = 0;
+    let freed_logs = prune_oldest_logs(&inner.database, &mut tx, excess).unwrap_or(0);
+    freed = freed + freed_logs;
+    if freed < excess {
+      let freed_metrics = prune_oldest_metrics(&inner.database, &mut tx, excess - freed).unwrap_or(0);
+      freed = freed + freed_metrics;
+    }
+    match tx_commit(&mut tx, &mut inner.database) {
+      Ok(_) => {
+        if freed > inner.stored_bytes {
+          inner.stored_bytes = 0;
+        } else {
+          inner.stored_bytes = inner.stored_bytes - freed;
+        }
+      }
+      Err(_) => {
+        let _ = tx_rollback(&mut tx, &mut inner.database);
+      }
+    }
+    // If capacity cannot be reclaimed to accommodate new records, reject ingestion
+    if inner.stored_bytes + added_bytes > config.max_disk_bytes {
+      pending.clear();
+      return Err(DbError.Limit("capacity_exceeded"));
+    }
+  }
+
   let mut accepted = 0;
   let mut duplicates = 0;
   match pending.flush(&mut inner.database) {
@@ -652,46 +713,6 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
       None => {}
     }
     k = k + 1;
-  }
-
-  // Retention pruning: discard logs older than retention_ms
-  if config.retention_ms > 0 && now > config.retention_ms {
-    let cutoff_ms = now - config.retention_ms;
-    let cutoff_ts = format_iso_timestamp(cutoff_ms);
-    let mut tx = begin_tx(&mut inner.database)?;
-    let pruned = prune_expired_logs(&inner.database, &mut tx, &cutoff_ts, 100);
-    match tx_commit(&mut tx, &mut inner.database) {
-      Ok(_) => {}
-      Err(_) => {
-        let _ = tx_rollback(&mut tx, &mut inner.database);
-      }
-    }
-  }
-
-  // Capacity FIFO rotation: discard oldest logs when stored_bytes exceeds max_disk_bytes
-  if config.max_disk_bytes > 0 && inner.stored_bytes > config.max_disk_bytes {
-    let excess = inner.stored_bytes - config.max_disk_bytes;
-    let mut tx = begin_tx(&mut inner.database)?;
-    let freed_res = prune_oldest_logs(&inner.database, &mut tx, excess);
-    match freed_res {
-      Ok(freed) => {
-        match tx_commit(&mut tx, &mut inner.database) {
-          Ok(_) => {
-            if freed > inner.stored_bytes {
-              inner.stored_bytes = 0;
-            } else {
-              inner.stored_bytes = inner.stored_bytes - freed;
-            }
-          }
-          Err(_) => {
-            let _ = tx_rollback(&mut tx, &mut inner.database);
-          }
-        }
-      }
-      Err(_) => {
-        let _ = tx_rollback(&mut tx, &mut inner.database);
-      }
-    }
   }
 
   return Ok(Stored { accepted: accepted, duplicates: duplicates });
