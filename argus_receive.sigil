@@ -4,6 +4,9 @@ module argus_receive
 
 use argus_collect.batch;
 use argus_collect.initialize;
+use argus_collect.prune_expired_logs;
+use argus_collect.prune_oldest_logs;
+use argus_collect.prune_oldest_metrics;
 use argus_health.Health;
 use argus_health.Heartbeat;
 use argus_health.default_heartbeat;
@@ -14,11 +17,17 @@ use argus_query.log_filter;
 use argus_query.metric_summary;
 use argus_query.recent_logs;
 use db.database.Database;
+use db.database.begin_tx;
 use db.database.open_database;
+use db.database.tx_commit;
+use db.database.tx_rollback;
 use db.error.DbError;
 use db.error.is_duplicate_key;
+use db.relation.ScanOrder;
+use db.relation.rel_scan;
+use db.types.Value;
 
-// Receiving port and query API of ADR 0067 decision 7, stage 3.
+// Receiving port and query API of ADR 0067 decision 7, stage 3 & stage 4.
 //
 // One listener serves two kinds of connection, told apart by the first byte:
 //   - HTTP/1.1 (anything else): POST /ingest takes NDJSON; GET /api/logs, /api/metrics, /api/components and /healthz
@@ -27,6 +36,7 @@ use db.error.is_duplicate_key;
 // Records are validated and normalized with argus_observe.accept_line before they are stored through argus_collect.
 // Every limit is a configured bound: connections, request head and body bytes, requests per connection, one NDJSON
 // line (64 KB, ADR 0067 decision 2), query result and scan sizes, and one whole-request I/O deadline.
+// Stage 4 adds: disk capacity limit (10 GB) FIFO rotation, retention period (7 days) pruning, and rate limiting (429).
 
 pub struct ReceiverConfig {
   host: String,
@@ -40,6 +50,9 @@ pub struct ReceiverConfig {
   scan_limit: Int,
   max_components: Int,
   test_clock: Option<Atomic<Int>>,
+  max_rate: Int,
+  retention_ms: Int,
+  max_disk_bytes: Int,
 }
 
 pub enum ReceiverError {
@@ -57,6 +70,9 @@ pub struct State {
   database: Database,
   beats: List<Beat>,
   last_ms: Int,
+  rate_window_ms: Int,
+  rate_count: Int,
+  stored_bytes: Int,
 }
 
 pub struct Hub {
@@ -89,12 +105,12 @@ struct Stored {
 }
 
 pub fn default_config(db_path: String) -> ReceiverConfig
-  intent "Loopback defaults: 64 connections, 10 s per request, 1 MiB body, 1000 requests per connection."
+  intent "Loopback defaults: 64 connections, 10 s per request, 1 MiB body, 1000 requests per connection, 10000 records/s, 7 days retention, 10 GB disk."
   requires none
   ensures none
   effects none
 {
-  return ReceiverConfig { host: "127.0.0.1", port: 7490, db_path: db_path, max_connections: 64, io_timeout_ms: 10000, max_body_bytes: 1048576, max_requests: 1000, query_max: 500, scan_limit: 5000, max_components: 1024, test_clock: None };
+  return ReceiverConfig { host: "127.0.0.1", port: 7490, db_path: db_path, max_connections: 64, io_timeout_ms: 10000, max_body_bytes: 1048576, max_requests: 1000, query_max: 500, scan_limit: 5000, max_components: 1024, test_clock: None, max_rate: 10000, retention_ms: 604800000, max_disk_bytes: 10737418240 };
 }
 
 pub fn with_listen(config: ReceiverConfig, host: String, port: Int) -> ReceiverConfig
@@ -146,6 +162,29 @@ pub fn with_test_clock(config: ReceiverConfig, clock_ms: Atomic<Int>) -> Receive
   return next;
 }
 
+pub fn with_retention(config: ReceiverConfig, retention_ms: Int, max_disk_bytes: Int) -> ReceiverConfig
+  intent "Set data retention in milliseconds (0 for unlimited) and disk capacity limit in bytes (0 for unlimited)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.retention_ms = retention_ms;
+  next.max_disk_bytes = max_disk_bytes;
+  return next;
+}
+
+pub fn with_rate_limit(config: ReceiverConfig, max_rate: Int) -> ReceiverConfig
+  intent "Set maximum ingested records per second window (0 for unlimited)."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.max_rate = max_rate;
+  return next;
+}
+
 fn database_id() -> Bytes
   intent "A fixed database identity derived from the component name."
   requires none
@@ -183,13 +222,39 @@ fn state_time(inner: &mut State, observed: Int) -> Int
   return inner.last_ms;
 }
 
+fn initial_stored_log_bytes(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "Count initial stored payload bytes from existing payload chunks."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_payloads", &None, &None, &ScanOrder.Asc, -1)?;
+  let mut total = 0;
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      Some(row) => {
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            total = total + bytes.byte_len();
+          }
+          _ => {}
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(total);
+}
+
 pub fn open_hub(config: ReceiverConfig) -> Result<Hub, ReceiverError>
   intent "Validate the configuration and open the sigil-db database."
   requires none
   ensures none
   effects clock, fs, task.share, task.suspend
 {
-  if config.max_connections < 1 || config.max_connections > 4096 || config.io_timeout_ms < 10 || config.max_body_bytes < 1 || config.max_body_bytes > 16777216 || config.max_requests < 1 || config.query_max < 1 || config.scan_limit < 1 || config.port < 0 || config.port > 65535 || config.max_components < 1 || config.db_path == "" {
+  if config.max_connections < 1 || config.max_connections > 4096 || config.io_timeout_ms < 10 || config.max_body_bytes < 1 || config.max_body_bytes > 16777216 || config.max_requests < 1 || config.query_max < 1 || config.scan_limit < 1 || config.port < 0 || config.port > 65535 || config.max_components < 1 || config.db_path == "" || config.max_rate < 0 || config.retention_ms < 0 || config.max_disk_bytes < 0 {
     return Err(ReceiverError.InvalidConfig);
   }
   let mut database = open_database(config.db_path.clone(), database_id()).map_err(|error| ReceiverError.Open)?;
@@ -199,8 +264,11 @@ pub fn open_hub(config: ReceiverConfig) -> Result<Hub, ReceiverError>
       return Err(ReceiverError.Open);
     }
   }
+  let mut tx = begin_tx(&mut database).map_err(|error| ReceiverError.Open)?;
+  let initial_bytes = initial_stored_log_bytes(&database, &mut tx).unwrap_or(0);
+  let _ = tx_rollback(&mut tx, &mut database);
   let start = raw_now(&config);
-  return Ok(Hub { inner: Lock.new(State { database: database, beats: List.new(), last_ms: start }), config: config });
+  return Ok(Hub { inner: Lock.new(State { database: database, beats: List.new(), last_ms: start, rate_window_ms: start, rate_count: 0, stored_bytes: initial_bytes }), config: config });
 }
 
 pub fn listen_on(config: &ReceiverConfig) -> Result<TcpListener, ReceiverError>
@@ -219,6 +287,141 @@ pub fn share_hub(hub: Hub) -> SyncShared<Hub>
   effects none
 {
   return SyncShared.new(hub);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Stage 4 helpers: timestamp formatting, rate limiting, body inspection
+
+fn format_two_digits(val: Int) -> Bytes
+  intent "Format 2-digit number as ASCII bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(48 + val / 10 % 10);
+  b.push(48 + val % 10);
+  return b;
+}
+
+fn format_four_digits(val: Int) -> Bytes
+  intent "Format 4-digit number as ASCII bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(48 + val / 1000 % 10);
+  b.push(48 + val / 100 % 10);
+  b.push(48 + val / 10 % 10);
+  b.push(48 + val % 10);
+  return b;
+}
+
+fn format_three_digits(val: Int) -> Bytes
+  intent "Format 3-digit number as ASCII bytes."
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.new();
+  b.push(48 + val / 100 % 10);
+  b.push(48 + val / 10 % 10);
+  b.push(48 + val % 10);
+  return b;
+}
+
+fn format_iso_timestamp(epoch_ms: Int) -> String
+  intent "Format epoch milliseconds as ISO 8601 UTC timestamp: YYYY-MM-DDTHH:MM:SS.mmm000Z."
+  requires none
+  ensures none
+  effects none
+{
+  if epoch_ms < 0 {
+    return "1970-01-01T00:00:00.000000Z";
+  }
+  let total_seconds = epoch_ms / 1000;
+  let millis = epoch_ms % 1000;
+  let days = total_seconds / 86400;
+  let day_seconds = total_seconds % 86400;
+  let hour = day_seconds / 3600;
+  let minute = day_seconds % 3600 / 60;
+  let second = day_seconds % 60;
+
+  let z = days + 719468;
+  let era = z / 146097;
+  let doe = z - era * 146097;
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  let y = yoe + era * 400;
+  let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  let mp = (5 * doy + 2) / 153;
+  let d = doy - (153 * mp + 2) / 5 + 1;
+  let mut m = mp - 9;
+  if mp < 10 {
+    m = mp + 3;
+  }
+  let mut year = y;
+  if m <= 2 {
+    year = y + 1;
+  }
+
+  let mut buf = Bytes.new();
+  buf.extend(&format_four_digits(year));
+  buf.push(45);
+  buf.extend(&format_two_digits(m));
+  buf.push(45);
+  buf.extend(&format_two_digits(d));
+  buf.push(84);
+  buf.extend(&format_two_digits(hour));
+  buf.push(58);
+  buf.extend(&format_two_digits(minute));
+  buf.push(58);
+  buf.extend(&format_two_digits(second));
+  buf.push(46);
+  buf.extend(&format_three_digits(millis));
+  buf.extend(&"000Z".as_bytes());
+  return buf.to_string_utf8().unwrap_or("1970-01-01T00:00:00.000000Z");
+}
+
+fn check_rate_limit(inner: &mut State, config: &ReceiverConfig, count: Int, now: Int) -> Bool
+  intent "Check and update the rate limit window (fixed 1-second window)."
+  requires none
+  ensures none
+  effects none
+{
+  if config.max_rate <= 0 {
+    return true;
+  }
+  if now < inner.rate_window_ms || now >= inner.rate_window_ms + 1000 {
+    inner.rate_window_ms = now;
+    inner.rate_count = 0;
+  }
+  if inner.rate_count + count > config.max_rate {
+    return false;
+  }
+  inner.rate_count = inner.rate_count + count;
+  return true;
+}
+
+fn body_has(buf: &Bytes, needle: &String) -> Bool
+  intent "Substring test on raw byte buffer."
+  requires none
+  ensures none
+  effects none
+{
+  let want = needle.as_bytes();
+  let mut i = 0;
+  while i + want.byte_len() <= buf.byte_len() {
+    let mut j = 0;
+    while j < want.byte_len() && buf.get(i + j).unwrap_or(0) == want.get(j).unwrap_or(1) {
+      j = j + 1;
+    }
+    if j == want.byte_len() {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -378,12 +581,43 @@ fn store_one(inner: &mut State, line: &Line) -> Result<Bool, DbError>
 }
 
 fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, observed: Int) -> Result<Stored, DbError>
-  intent "Store a request's records; a duplicate metric sample falls back to per-record transactions."
+  intent "Store a request's records; rate limit, retention pruning, and capacity FIFO rotation applied."
   requires none
   ensures none
   effects fs
 {
   let now = state_time(&mut inner, observed);
+  if !check_rate_limit(&mut inner, &config, lines.len(), now) {
+    return Err(DbError.Limit("rate_limited"));
+  }
+
+  // Retention pruning: discard logs older than retention_ms and subtract freed bytes upon commit
+  if config.retention_ms > 0 && now > config.retention_ms {
+    let cutoff_ms = now - config.retention_ms;
+    let cutoff_ts = format_iso_timestamp(cutoff_ms);
+    let mut tx = begin_tx(&mut inner.database)?;
+    let pruned_res = prune_expired_logs(&inner.database, &mut tx, &cutoff_ts, 100);
+    match pruned_res {
+      Ok(freed) => {
+        match tx_commit(&mut tx, &mut inner.database) {
+          Ok(_) => {
+            if freed > inner.stored_bytes {
+              inner.stored_bytes = 0;
+            } else {
+              inner.stored_bytes = inner.stored_bytes - freed;
+            }
+          }
+          Err(_) => {
+            let _ = tx_rollback(&mut tx, &mut inner.database);
+          }
+        }
+      }
+      Err(_) => {
+        let _ = tx_rollback(&mut tx, &mut inner.database);
+      }
+    }
+  }
+
   let mut pending = batch(lines.len() * 65536 + 1)?;
   let mut i = 0;
   while i < lines.len() {
@@ -395,38 +629,66 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     }
     i = i + 1;
   }
+
+  // Filter out duplicate metrics already in database or earlier in the batch
+  let mut cap_tx = begin_tx(&mut inner.database)?;
+  let duplicate_count = pending.drop_existing_metrics(&inner.database, &mut cap_tx)?;
+  let net_bytes = pending.byte_size();
+
+  // If incoming batch alone exceeds max_disk_bytes, reject immediately without pruning
+  if config.max_disk_bytes > 0 && net_bytes > config.max_disk_bytes {
+    let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+    pending.clear();
+    return Err(DbError.Limit("capacity_exceeded"));
+  }
+
+  // Capacity FIFO rotation: discard oldest logs and metrics when stored_bytes + net_bytes exceeds max_disk_bytes
+  if config.max_disk_bytes > 0 && inner.stored_bytes + net_bytes > config.max_disk_bytes {
+    let excess = inner.stored_bytes + net_bytes - config.max_disk_bytes;
+    let mut freed = 0;
+    let freed_logs = prune_oldest_logs(&inner.database, &mut cap_tx, excess).unwrap_or(0);
+    freed = freed + freed_logs;
+    if freed < excess {
+      let freed_metrics = prune_oldest_metrics(&inner.database, &mut cap_tx, excess - freed).unwrap_or(0);
+      freed = freed + freed_metrics;
+    }
+    // If capacity cannot be reclaimed to accommodate new records, rollback pruning and reject
+    if inner.stored_bytes - freed + net_bytes > config.max_disk_bytes {
+      let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+      pending.clear();
+      return Err(DbError.Limit("capacity_exceeded"));
+    }
+    match tx_commit(&mut cap_tx, &mut inner.database) {
+      Ok(_) => {
+        if freed > inner.stored_bytes {
+          inner.stored_bytes = 0;
+        } else {
+          inner.stored_bytes = inner.stored_bytes - freed;
+        }
+      }
+      Err(_) => {
+        let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+        pending.clear();
+        return Err(DbError.Limit("capacity_exceeded"));
+      }
+    }
+  } else {
+    let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+  }
+
   let mut accepted = 0;
-  let mut duplicates = 0;
+  let mut duplicates = duplicate_count;
   match pending.flush(&mut inner.database) {
     Ok(count) => {
       accepted = count;
+      inner.stored_bytes = inner.stored_bytes + net_bytes;
     }
     Err(error) => {
-      if !is_duplicate_key(&error) {
-        pending.clear();
-        return Err(error);
-      }
       pending.clear();
-      let mut j = 0;
-      while j < lines.len() {
-        match lines.get(j) {
-          Some(line) => {
-            match store_one(&mut inner, &line) {
-              Ok(done) => {
-                accepted = accepted + 1;
-              }
-              Err(single_error) => {
-                if is_duplicate_key(&single_error) {
-                  duplicates = duplicates + 1;
-                } else {
-                  return Err(single_error);
-                }
-              }
-            }
-          }
-          None => {}
-        }
-        j = j + 1;
+      if is_duplicate_key(&error) {
+        duplicates = duplicates + 1;
+      } else {
+        return Err(error);
       }
     }
   }
@@ -445,6 +707,7 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     }
     k = k + 1;
   }
+
   return Ok(Stored { accepted: accepted, duplicates: duplicates });
 }
 
@@ -831,6 +1094,7 @@ fn reason_phrase(status: Int) -> String
     405 => "Method Not Allowed",
     413 => "Payload Too Large",
     422 => "Unprocessable Entity",
+    429 => "Too Many Requests",
     431 => "Request Header Fields Too Large",
     501 => "Not Implemented",
     503 => "Service Unavailable",
@@ -936,6 +1200,14 @@ fn ingest_body(hub: &Hub, body: &Bytes) -> Bytes
         duplicates = stored.duplicates;
       }
       Err(error) => {
+        match error {
+          DbError.Limit(msg) => {
+            if msg == "rate_limited" {
+              return error_body(&"rate_limited");
+            }
+          }
+          _ => {}
+        }
         return error_body(&"storage_failed");
       }
     }
@@ -1183,7 +1455,11 @@ fn serve_http(session: &Session, first: &Bytes)
               Ok(found) => {
                 body = found;
                 if request.path == "/ingest" && body.byte_len() > 9 && body.get(2).unwrap_or(0) == 101 {
-                  status = 503;
+                  if body_has(&body, &"rate_limited") {
+                    status = 429;
+                  } else {
+                    status = 503;
+                  }
                 }
               }
               Err(code) => {
@@ -1229,6 +1505,14 @@ fn raw_line_reply(hub: &Hub, row: &Bytes) -> Bytes
       return "ERR duplicate\n".as_bytes();
     }
     Err(error) => {
+      match error {
+        DbError.Limit(msg) => {
+          if msg == "rate_limited" {
+            return "ERR rate_limited\n".as_bytes();
+          }
+        }
+        _ => {}
+      }
       return "ERR storage_failed\n".as_bytes();
     }
   }

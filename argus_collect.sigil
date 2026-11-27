@@ -14,8 +14,14 @@ use db.relation.ScanOrder;
 use db.relation.column;
 use db.relation.rel_create_index;
 use db.relation.rel_create_table;
+use db.relation.rel_delete;
+use db.relation.rel_drop_table;
+use db.relation.rel_get;
+use db.relation.rel_index_exists;
 use db.relation.rel_insert;
 use db.relation.rel_scan;
+use db.relation.rel_scan_index;
+use db.relation.rel_table_columns;
 use db.relation.rel_table_exists;
 use db.types.Value;
 use db.types.compare_bytes;
@@ -189,37 +195,75 @@ fn metric_key(nodes: &List<JsonNode>, fields: &List<JsonField>, labels: &List<Js
 }
 
 fn schema(database: &Database, tx: &mut Tx) -> Result<Bool, DbError>
-  intent "Create observation tables and log indexes in one transaction."
+  intent "Create observation tables and log indexes in one transaction, migrating existing tables if needed."
   requires none
   ensures none
   effects fs
 {
-  if rel_table_exists(&database, &mut tx, &"argus_logs")? {
-    return Ok(true);
+  if !rel_table_exists(&database, &mut tx, &"argus_logs")? {
+    let mut logs = List.new();
+    logs.push(column("id", tag_int()));
+    logs.push(column("ts", tag_str()));
+    logs.push(column("component_hash", tag_bytes()));
+    logs.push(column("level", tag_str()));
+    logs.push(column("chunks", tag_int()));
+    rel_create_table(&database, &mut tx, &"argus_logs", &logs, &"id")?;
+    rel_create_index(&database, &mut tx, &"argus_log_ts", &"argus_logs", &"ts", false)?;
+    rel_create_index(&database, &mut tx, &"argus_log_component", &"argus_logs", &"component_hash", false)?;
+    rel_create_index(&database, &mut tx, &"argus_log_level", &"argus_logs", &"level", false)?;
   }
-  let mut logs = List.new();
-  logs.push(column("id", tag_int()));
-  logs.push(column("ts", tag_str()));
-  logs.push(column("component_hash", tag_bytes()));
-  logs.push(column("level", tag_str()));
-  logs.push(column("chunks", tag_int()));
-  rel_create_table(&database, &mut tx, &"argus_logs", &logs, &"id")?;
-  rel_create_index(&database, &mut tx, &"argus_log_ts", &"argus_logs", &"ts", false)?;
-  rel_create_index(&database, &mut tx, &"argus_log_component", &"argus_logs", &"component_hash", false)?;
-  rel_create_index(&database, &mut tx, &"argus_log_level", &"argus_logs", &"level", false)?;
 
-  let mut metrics = List.new();
-  metrics.push(column("key", tag_bytes()));
-  metrics.push(column("ts", tag_str()));
-  metrics.push(column("component_hash", tag_bytes()));
-  metrics.push(column("labels_hash", tag_bytes()));
-  metrics.push(column("chunks", tag_int()));
-  rel_create_table(&database, &mut tx, &"argus_metrics", &metrics, &"key")?;
+  if !rel_table_exists(&database, &mut tx, &"argus_payloads")? {
+    let mut chunks = List.new();
+    chunks.push(column("key", tag_bytes()));
+    chunks.push(column("data", tag_bytes()));
+    rel_create_table(&database, &mut tx, &"argus_payloads", &chunks, &"key")?;
+  }
 
-  let mut chunks = List.new();
-  chunks.push(column("key", tag_bytes()));
-  chunks.push(column("data", tag_bytes()));
-  return rel_create_table(&database, &mut tx, &"argus_payloads", &chunks, &"key");
+  if !rel_table_exists(&database, &mut tx, &"argus_metrics")? {
+    let mut metrics = List.new();
+    metrics.push(column("key", tag_bytes()));
+    metrics.push(column("ts", tag_str()));
+    metrics.push(column("component_hash", tag_bytes()));
+    metrics.push(column("labels_hash", tag_bytes()));
+    metrics.push(column("chunks", tag_int()));
+    metrics.push(column("seq", tag_int()));
+    rel_create_table(&database, &mut tx, &"argus_metrics", &metrics, &"key")?;
+    rel_create_index(&database, &mut tx, &"argus_metric_seq", &"argus_metrics", &"seq", false)?;
+  } else {
+    let cols = rel_table_columns(&database, &mut tx, &"argus_metrics")?;
+    if cols.len() < 6 {
+      let old_rows = rel_scan(&database, &mut tx, &"argus_metrics", &None, &None, &ScanOrder.Asc, -1)?;
+      rel_drop_table(&database, &mut tx, &"argus_metrics")?;
+      let mut metrics = List.new();
+      metrics.push(column("key", tag_bytes()));
+      metrics.push(column("ts", tag_str()));
+      metrics.push(column("component_hash", tag_bytes()));
+      metrics.push(column("labels_hash", tag_bytes()));
+      metrics.push(column("chunks", tag_int()));
+      metrics.push(column("seq", tag_int()));
+      rel_create_table(&database, &mut tx, &"argus_metrics", &metrics, &"key")?;
+      rel_create_index(&database, &mut tx, &"argus_metric_seq", &"argus_metrics", &"seq", false)?;
+      let mut k = 0;
+      while k < old_rows.len() {
+        match old_rows.get(k) {
+          Some(old_row) => {
+            let mut new_row = old_row.clone();
+            new_row.push(Value.IntVal(k + 1));
+            rel_insert(&database, &mut tx, &"argus_metrics", &new_row)?;
+          }
+          None => {}
+        }
+        k = k + 1;
+      }
+    } else {
+      if !rel_index_exists(&database, &mut tx, &"argus_metric_seq")? {
+        rel_create_index(&database, &mut tx, &"argus_metric_seq", &"argus_metrics", &"seq", false)?;
+      }
+    }
+  }
+
+  return Ok(true);
 }
 
 fn finish(database: &mut Database, tx: &mut Tx, staged: Result<Bool, DbError>) -> Result<Bool, DbError>
@@ -269,6 +313,29 @@ fn last_log_id(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
   return Ok(0);
 }
 
+fn last_metric_seq(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "Read the highest committed metric sequence while holding the database transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  if !rel_index_exists(&database, &mut tx, &"argus_metric_seq")? {
+    return Ok(0);
+  }
+  let rows = rel_scan_index(&database, &mut tx, &"argus_metric_seq", &None, &None, &ScanOrder.Desc, 1)?;
+  if rows.len() > 0 {
+    let row = match rows.get(0) {
+      Some(item) => Ok(item.clone()),
+      None => Err(DbError.Corrupt("missing observation metric row")),
+    }?;
+    return match row.get(5) {
+      Some(Value.IntVal(seq)) => Ok(seq + 0),
+      _ => Err(DbError.Corrupt("invalid observation metric seq")),
+    };
+  }
+  return Ok(0);
+}
+
 fn stage(database: &Database, tx: &mut Tx, records: &List<Record>) -> Result<Bool, DbError>
   intent "Append all record headers, indexes and payload chunks in the same transaction."
   requires none
@@ -276,6 +343,26 @@ fn stage(database: &Database, tx: &mut Tx, records: &List<Record>) -> Result<Boo
   effects fs
 {
   let mut log_id = last_log_id(&database, &mut tx)?;
+  let mut metric_seq = 0;
+  let mut has_metrics = false;
+  let mut check_idx = 0;
+  while check_idx < records.len() && !has_metrics {
+    match records.get(check_idx) {
+      Some(r) => {
+        match r.key {
+          RecordKey.Metric(_, _) => {
+            has_metrics = true;
+          }
+          _ => {}
+        }
+      }
+      None => {}
+    }
+    check_idx = check_idx + 1;
+  }
+  if has_metrics {
+    metric_seq = last_metric_seq(&database, &mut tx)?;
+  }
   let mut i = 0;
   while i < records.len() {
     let record = match records.get(i) {
@@ -319,6 +406,16 @@ fn stage(database: &Database, tx: &mut Tx, records: &List<Record>) -> Result<Boo
       }
     }
     row.push(Value.IntVal((record.data.byte_len() - 1) / 4000 + 1));
+    match &record.key {
+      RecordKey.Log(_) => {}
+      RecordKey.Metric(_, _) => {
+        if metric_seq == 9223372036854775807 {
+          return Err(DbError.Limit("observation metric sequence exhausted"));
+        }
+        metric_seq = metric_seq + 1;
+        row.push(Value.IntVal(metric_seq));
+      }
+    }
     rel_insert(&database, &mut tx, &table, &row)?;
     let mut start = 0;
     while start < record.data.byte_len() {
@@ -348,6 +445,123 @@ impl Batch {
     effects none
   {
     return self.records.len();
+  }
+
+  pub fn byte_size(self: &Batch) -> Int
+    intent "Read the total byte size of buffered records."
+    requires none
+    ensures none
+    effects none
+  {
+    return self.size;
+  }
+
+  pub fn drop_existing_metrics(self: &mut Batch, database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+    intent "Remove duplicate metric samples already in the database or earlier in the batch, returning duplicate count."
+    requires none
+    ensures none
+    effects fs
+  {
+    let mut kept = List.new();
+    let mut seen_metric_keys = List.new();
+    let mut duplicates = 0;
+    let mut new_size = 0;
+    let mut i = 0;
+    while i < self.records.len() {
+      match self.records.get(i) {
+        Some(record) => {
+          match record.key {
+            RecordKey.Log(_) => {
+              new_size = new_size + record.data.byte_len();
+              kept.push(record.clone());
+            }
+            RecordKey.Metric(key, _) => {
+              let mut duplicate = false;
+              let mut j = 0;
+              while j < seen_metric_keys.len() && !duplicate {
+                match seen_metric_keys.get(j) {
+                  Some(prev) => {
+                    if compare_bytes(&prev, &key) == 0 {
+                      duplicate = true;
+                    }
+                  }
+                  None => {}
+                }
+                j = j + 1;
+              }
+              if duplicate {
+                duplicates = duplicates + 1;
+              } else {
+                seen_metric_keys.push(key.clone());
+                match rel_get(&database, &mut tx, &"argus_metrics", &Value.BytesVal(key.clone()))? {
+                  Some(_) => {
+                    duplicates = duplicates + 1;
+                  }
+                  None => {
+                    new_size = new_size + record.data.byte_len();
+                    kept.push(record.clone());
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    self.records = kept;
+    self.size = new_size;
+    return Ok(duplicates);
+  }
+
+  pub fn net_new_bytes(self: &Batch, database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+    intent "Calculate the bytes of new records that will actually be stored, excluding duplicate metrics."
+    requires none
+    ensures none
+    effects fs
+  {
+    let mut total = 0;
+    let mut seen_metric_keys = List.new();
+    let mut i = 0;
+    while i < self.records.len() {
+      match self.records.get(i) {
+        Some(record) => {
+          match record.key {
+            RecordKey.Log(_) => {
+              total = total + record.data.byte_len();
+            }
+            RecordKey.Metric(key, _) => {
+              let mut duplicate = false;
+              let mut j = 0;
+              while j < seen_metric_keys.len() && !duplicate {
+                match seen_metric_keys.get(j) {
+                  Some(prev) => {
+                    if compare_bytes(&prev, &key) == 0 {
+                      duplicate = true;
+                    }
+                  }
+                  None => {}
+                }
+                j = j + 1;
+              }
+              if !duplicate {
+                seen_metric_keys.push(key.clone());
+                match rel_get(&database, &mut tx, &"argus_metrics", &Value.BytesVal(key.clone()))? {
+                  Some(_) => {}
+                  None => {
+                    total = total + record.data.byte_len();
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => {}
+      }
+      i = i + 1;
+    }
+    return Ok(total);
   }
 
   pub fn append(self: &mut Batch, line: &Line) -> Result<Bool, DbError>
@@ -406,4 +620,235 @@ impl Batch {
       }
     }
   }
+}
+
+pub fn delete_log(database: &Database, tx: &mut Tx, id: Int, chunks: Int) -> Result<Int, DbError>
+  intent "Delete one log record and its payload chunks; returns bytes freed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut payload_key = Bytes.new();
+  encode_value(&Value.IntVal(id), &mut payload_key);
+  let mut freed = 0;
+  let mut c = 0;
+  while c < chunks {
+    let mut chunk_key = payload_key.clone();
+    chunk_key.push_u64_be(c);
+    match rel_get(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key.clone()))? {
+      Some(row) => {
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            freed = freed + bytes.byte_len();
+          }
+          _ => {
+            freed = freed + 4000;
+          }
+        }
+      }
+      None => {}
+    }
+    let _ = rel_delete(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key));
+    c = c + 1;
+  }
+  rel_delete(&database, &mut tx, &"argus_logs", &Value.IntVal(id))?;
+  if freed == 0 {
+    freed = 100;
+  }
+  return Ok(freed);
+}
+
+pub fn prune_oldest_logs(database: &Database, tx: &mut Tx, target_bytes_to_free: Int) -> Result<Int, DbError>
+  intent "Drop oldest logs FIFO until target_bytes_to_free is reached or no more logs."
+  requires none
+  ensures none
+  effects fs
+{
+  if target_bytes_to_free <= 0 {
+    return Ok(0);
+  }
+  let mut total_freed = 0;
+  let mut empty_scan = false;
+  while total_freed < target_bytes_to_free && !empty_scan {
+    let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 50)?;
+    if rows.len() == 0 {
+      empty_scan = true;
+    } else {
+      let mut i = 0;
+      let mut deleted_in_batch = 0;
+      while i < rows.len() && total_freed < target_bytes_to_free {
+        match rows.get(i) {
+          Some(row) => {
+            let id = match row.get(0) {
+              Some(Value.IntVal(num)) => num + 0,
+              _ => 0,
+            };
+            let chunks = match row.get(4) {
+              Some(Value.IntVal(num)) => num + 0,
+              _ => 0,
+            };
+            if id > 0 {
+              let freed = delete_log(&database, &mut tx, id, chunks)?;
+              total_freed = total_freed + freed;
+              deleted_in_batch = deleted_in_batch + 1;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if deleted_in_batch == 0 {
+        empty_scan = true;
+      }
+    }
+  }
+  return Ok(total_freed);
+}
+
+pub fn delete_metric(database: &Database, tx: &mut Tx, key: &Bytes, chunks: Int) -> Result<Int, DbError>
+  intent "Delete one metric record and its payload chunks; returns bytes freed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut payload_key = Bytes.new();
+  encode_value(&Value.BytesVal(key.clone()), &mut payload_key);
+  let mut freed = 0;
+  let mut c = 0;
+  while c < chunks {
+    let mut chunk_key = payload_key.clone();
+    chunk_key.push_u64_be(c);
+    match rel_get(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key.clone()))? {
+      Some(row) => {
+        match row.get(1) {
+          Some(Value.BytesVal(bytes)) => {
+            freed = freed + bytes.byte_len();
+          }
+          _ => {
+            freed = freed + 4000;
+          }
+        }
+      }
+      None => {}
+    }
+    let _ = rel_delete(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key));
+    c = c + 1;
+  }
+  rel_delete(&database, &mut tx, &"argus_metrics", &Value.BytesVal(key.clone()))?;
+  if freed == 0 {
+    freed = 100;
+  }
+  return Ok(freed);
+}
+
+pub fn prune_oldest_metrics(database: &Database, tx: &mut Tx, target_bytes_to_free: Int) -> Result<Int, DbError>
+  intent "Drop oldest metrics FIFO until target_bytes_to_free is reached or no more metrics."
+  requires none
+  ensures none
+  effects fs
+{
+  if target_bytes_to_free <= 0 {
+    return Ok(0);
+  }
+  let mut total_freed = 0;
+  let mut empty_scan = false;
+  while total_freed < target_bytes_to_free && !empty_scan {
+    let rows = rel_scan_index(&database, &mut tx, &"argus_metric_seq", &None, &None, &ScanOrder.Asc, 50)?;
+    if rows.len() == 0 {
+      empty_scan = true;
+    } else {
+      let mut i = 0;
+      let mut deleted_in_batch = 0;
+      while i < rows.len() && total_freed < target_bytes_to_free {
+        match rows.get(i) {
+          Some(row) => {
+            let key = match row.get(0) {
+              Some(Value.BytesVal(b)) => b.clone(),
+              _ => Bytes.new(),
+            };
+            let chunks = match row.get(4) {
+              Some(Value.IntVal(num)) => num + 0,
+              _ => 0,
+            };
+            if key.byte_len() > 0 {
+              let freed = delete_metric(&database, &mut tx, &key, chunks)?;
+              total_freed = total_freed + freed;
+              deleted_in_batch = deleted_in_batch + 1;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if deleted_in_batch == 0 {
+        empty_scan = true;
+      }
+    }
+  }
+  return Ok(total_freed);
+}
+
+pub fn prune_expired_logs(database: &Database, tx: &mut Tx, cutoff_ts: &String, max_count: Int) -> Result<Int, DbError>
+  intent "Drop logs with ts strictly earlier than cutoff_ts; returns total bytes freed."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut total_freed = 0;
+  let mut deleted_count = 0;
+  let cutoff_bytes = cutoff_ts.as_bytes();
+  let mut stopped = false;
+  while deleted_count < max_count && !stopped {
+    let rows = rel_scan_index(&database, &mut tx, &"argus_log_ts", &None, &Some(Value.StrVal(cutoff_ts.clone())), &ScanOrder.Asc, 50)?;
+    if rows.len() == 0 {
+      stopped = true;
+    } else {
+      let mut batch_deleted = 0;
+      let mut i = 0;
+      while i < rows.len() && deleted_count < max_count && !stopped {
+        match rows.get(i) {
+          Some(row) => {
+            let ts = match row.get(1) {
+              Some(Value.StrVal(text)) => text.clone(),
+              _ => "",
+            };
+            if compare_bytes(&ts.as_bytes(), &cutoff_bytes) < 0 {
+              let id = match row.get(0) {
+                Some(Value.IntVal(num)) => num + 0,
+                _ => 0,
+              };
+              let chunks = match row.get(4) {
+                Some(Value.IntVal(num)) => num + 0,
+                _ => 0,
+              };
+              if id > 0 {
+                let freed = delete_log(&database, &mut tx, id, chunks)?;
+                total_freed = total_freed + freed;
+                deleted_count = deleted_count + 1;
+                batch_deleted = batch_deleted + 1;
+              }
+            } else {
+              stopped = true;
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      if batch_deleted == 0 {
+        stopped = true;
+      }
+    }
+  }
+  return Ok(total_freed);
+}
+
+pub fn count_logs(database: &Database, tx: &mut Tx) -> Result<Int, DbError>
+  intent "Count the total committed log rows."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Asc, 1000000)?;
+  return Ok(rows.len());
 }
