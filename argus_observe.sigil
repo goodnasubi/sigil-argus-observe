@@ -365,6 +365,15 @@ pub fn log_line(ts: &String, component: &String, level: Level, msg: &String, con
   ensures none
   effects none
 {
+  return encode_log(&ts, &component, level, &msg, &context, false);
+}
+
+fn encode_log(ts: &String, component: &String, level: Level, msg: &String, context: &LogContext, already_truncated: Bool) -> Result<Line, ObserveError>
+  intent "Encode one log line; already_truncated keeps the marker of a record that a producer had shortened."
+  requires none
+  ensures none
+  effects none
+{
   if !valid_timestamp(&ts) {
     return Err(ObserveError.InvalidTimestamp);
   }
@@ -404,7 +413,7 @@ pub fn log_line(ts: &String, component: &String, level: Level, msg: &String, con
   }
   let input = msg.as_bytes();
   let mut prefix = message_prefix(&input, budget);
-  if prefix.byte_len() < input.byte_len() {
+  if already_truncated || prefix.byte_len() < input.byte_len() {
     if budget < truncated.byte_len() {
       return Err(ObserveError.LogTooLarge);
     }
@@ -803,6 +812,21 @@ fn required_text(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String
   };
 }
 
+fn member_flag(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<Bool, ObserveError>
+  intent "Read an optional boolean member; a member of another type is invalid."
+  requires none
+  ensures none
+  effects none
+{
+  return match member_index(&nodes, &fields, &name) {
+    None => Ok(false),
+    Some(index) => match nodes.get(index) {
+      Some(JsonNode.Bool(flag)) => Ok(flag),
+      _ => Err(ObserveError.InvalidJson),
+    },
+  };
+}
+
 fn member_object(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<Option<JsonValue>, ObserveError>
   intent "Read an optional object member as a standalone JSON value."
   requires none
@@ -855,7 +879,8 @@ fn accept_log(nodes: &List<JsonNode>, fields: &List<JsonField>, ts: &String, com
   let target = member_text(&nodes, &fields, &"target")?;
   let err = member_object(&nodes, &fields, &"err")?;
   let extra = member_object(&nodes, &fields, &"fields")?;
-  return log_line(&ts, &component, level, &msg, &log_context(trace_id, span_id, target, err, extra));
+  let already_truncated = member_flag(&nodes, &fields, &"truncated")?;
+  return encode_log(&ts, &component, level, &msg, &log_context(trace_id, span_id, target, err, extra), already_truncated);
 }
 
 fn metric_value(nodes: &List<JsonNode>, fields: &List<JsonField>) -> Result<JsonNode, ObserveError>

@@ -173,7 +173,60 @@ pub fn main() -> Int
   if text_of(&accept_line(&wide_component(20000))) == "" {
     return 34;
   }
+  // A truncation marker set by the producer is kept; the canonical record stays within 64 KB.
+  let marked = accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"cut\"}");
+  if text_of(&marked) != "{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"cut\"}\n" {
+    return 35;
+  }
+  if text_of(&accept_line(&text_of(&marked))) != text_of(&marked) {
+    return 36;
+  }
+  if text_of(&accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":false,\"msg\":\"whole\"}")) != "{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":\"whole\"}\n" {
+    return 37;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":\"yes\",\"msg\":\"x\"}"), ObserveError.InvalidJson) {
+    return 38;
+  }
+  let big_marked = text_of(&accept_line(&marked_with(65380)));
+  if big_marked == "" || big_marked.as_bytes().byte_len() > 65536 || !has_marker(&big_marked) {
+    return 39;
+  }
   return 0;
+}
+
+fn has_marker(text: &String) -> Bool
+  intent "True when the record carries the truncation marker."
+  requires none
+  ensures none
+  effects none
+{
+  let hay = text.as_bytes();
+  let want = "\"truncated\":true".as_bytes();
+  let mut i = 0;
+  while i + want.byte_len() <= hay.byte_len() {
+    let mut j = 0;
+    while j < want.byte_len() && hay.get(i + j).unwrap_or(0) == want.get(j).unwrap_or(1) {
+      j = j + 1;
+    }
+    if j == want.byte_len() {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn marked_with(count: Int) -> String
+  intent "A log record that a producer marked truncated, with a message of count letters."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"");
+  parts.push(filled(count));
+  parts.push("\"}");
+  return wrap(&parts);
 }
 
 fn wide_component(count: Int) -> String
