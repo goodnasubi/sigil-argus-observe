@@ -1,0 +1,1360 @@
+module argus_receive
+  targets server
+  trust none
+
+use argus_collect.batch;
+use argus_collect.initialize;
+use argus_health.Health;
+use argus_health.Heartbeat;
+use argus_health.default_heartbeat;
+use argus_observe.Line;
+use argus_observe.ObserveError;
+use argus_observe.accept_line;
+use argus_query.log_filter;
+use argus_query.metric_summary;
+use argus_query.recent_logs;
+use db.database.Database;
+use db.database.open_database;
+use db.error.DbError;
+use db.error.is_duplicate_key;
+
+// Receiving port and query API of ADR 0067 decision 7, stage 3.
+//
+// One listener serves two kinds of connection, told apart by the first byte:
+//   - HTTP/1.1 (anything else): POST /ingest takes NDJSON; GET /api/logs, /api/metrics, /api/components and /healthz
+//     answer queries for the sigil-orchestra dashboard.
+//   - raw TCP NDJSON (first byte `{`): one record per line, answered with "OK" or "ERR <reason>" per line.
+// Records are validated and normalized with argus_observe.accept_line before they are stored through argus_collect.
+// Every limit is a configured bound: connections, request head and body bytes, requests per connection, one NDJSON
+// line (64 KB, ADR 0067 decision 2), query result and scan sizes, and one whole-request I/O deadline.
+
+pub struct ReceiverConfig {
+  host: String,
+  port: Int,
+  db_path: String,
+  max_connections: Int,
+  io_timeout_ms: Int,
+  max_body_bytes: Int,
+  max_requests: Int,
+  query_max: Int,
+  scan_limit: Int,
+  max_components: Int,
+  test_clock: Option<Atomic<Int>>,
+}
+
+pub enum ReceiverError {
+  InvalidConfig,
+  Open,
+  Listen,
+}
+
+pub struct Beat {
+  component: String,
+  heartbeat: Heartbeat,
+}
+
+pub struct State {
+  database: Database,
+  beats: List<Beat>,
+  last_ms: Int,
+}
+
+pub struct Hub {
+  inner: Lock<State>,
+  config: ReceiverConfig,
+}
+
+struct Session {
+  stream: TcpStream,
+  hub: SyncShared<Hub>,
+}
+
+struct Req {
+  method: String,
+  path: String,
+  query: String,
+  body: Bytes,
+  keep: Bool,
+  extra: Bytes,
+}
+
+struct RawRead {
+  line: Bytes,
+  rest: Bytes,
+}
+
+struct Stored {
+  accepted: Int,
+  duplicates: Int,
+}
+
+pub fn default_config(db_path: String) -> ReceiverConfig
+  intent "Loopback defaults: 64 connections, 10 s per request, 1 MiB body, 1000 requests per connection."
+  requires none
+  ensures none
+  effects none
+{
+  return ReceiverConfig { host: "127.0.0.1", port: 7490, db_path: db_path, max_connections: 64, io_timeout_ms: 10000, max_body_bytes: 1048576, max_requests: 1000, query_max: 500, scan_limit: 5000, max_components: 1024, test_clock: None };
+}
+
+pub fn with_listen(config: ReceiverConfig, host: String, port: Int) -> ReceiverConfig
+  intent "Choose the listening address; port 0 picks a free port."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.host = host;
+  next.port = port;
+  return next;
+}
+
+pub fn with_limits(config: ReceiverConfig, max_connections: Int, io_timeout_ms: Int, max_body_bytes: Int, max_requests: Int) -> ReceiverConfig
+  intent "Set the connection, deadline, body and per-connection request limits."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.max_connections = max_connections;
+  next.io_timeout_ms = io_timeout_ms;
+  next.max_body_bytes = max_body_bytes;
+  next.max_requests = max_requests;
+  return next;
+}
+
+pub fn with_query_limits(config: ReceiverConfig, query_max: Int, scan_limit: Int) -> ReceiverConfig
+  intent "Set the largest log page and the most rows one query may scan."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.query_max = query_max;
+  next.scan_limit = scan_limit;
+  return next;
+}
+
+pub fn with_test_clock(config: ReceiverConfig, clock_ms: Atomic<Int>) -> ReceiverConfig
+  intent "Read the health clock (milliseconds) from a shared cell instead of the system clock."
+  requires none
+  ensures none
+  effects none
+{
+  let mut next = config;
+  next.test_clock = Some(clock_ms);
+  return next;
+}
+
+fn database_id() -> Bytes
+  intent "A fixed database identity derived from the component name."
+  requires none
+  ensures none
+  effects none
+{
+  let digest = sha256(&"sigil-argus-observe".as_bytes());
+  return digest.slice(0, 16).unwrap_or(Bytes.new());
+}
+
+fn raw_now(config: &ReceiverConfig) -> Int
+  intent "Milliseconds from the test cell or the system clock."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  match config.test_clock {
+    Some(cell) => {
+      return cell.load();
+    }
+    None => {}
+  }
+  return clock.unix_seconds().unwrap_or(0) * 1000;
+}
+
+fn state_time(inner: &mut State, observed: Int) -> Int
+  intent "A health clock that never goes backwards."
+  requires none
+  ensures none
+  effects none
+{
+  if observed > inner.last_ms {
+    inner.last_ms = observed;
+  }
+  return inner.last_ms;
+}
+
+pub fn open_hub(config: ReceiverConfig) -> Result<Hub, ReceiverError>
+  intent "Validate the configuration and open the sigil-db database."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  if config.max_connections < 1 || config.max_connections > 4096 || config.io_timeout_ms < 10 || config.max_body_bytes < 1 || config.max_body_bytes > 16777216 || config.max_requests < 1 || config.query_max < 1 || config.scan_limit < 1 || config.port < 0 || config.port > 65535 || config.max_components < 1 || config.db_path == "" {
+    return Err(ReceiverError.InvalidConfig);
+  }
+  let mut database = open_database(config.db_path.clone(), database_id()).map_err(|error| ReceiverError.Open)?;
+  match initialize(&mut database) {
+    Ok(done) => {}
+    Err(error) => {
+      return Err(ReceiverError.Open);
+    }
+  }
+  let start = raw_now(&config);
+  return Ok(Hub { inner: Lock.new(State { database: database, beats: List.new(), last_ms: start }), config: config });
+}
+
+pub fn listen_on(config: &ReceiverConfig) -> Result<TcpListener, ReceiverError>
+  intent "Open the listening socket on the configured address."
+  requires none
+  ensures none
+  effects net.server
+{
+  return net.listen(&config.host, config.port, 128).map_err(|error| ReceiverError.Listen);
+}
+
+pub fn share_hub(hub: Hub) -> SyncShared<Hub>
+  intent "Make the opened database shareable between the connection tasks."
+  requires none
+  ensures none
+  effects none
+{
+  return SyncShared.new(hub);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// JSON text helpers
+
+fn scalar(node: JsonNode) -> Bytes
+  intent "Encode one JSON scalar."
+  requires none
+  ensures none
+  effects none
+{
+  let mut nodes = List.new();
+  nodes.push(node);
+  return json.stringify(&JsonValue.new(nodes, 0)).unwrap_or("null".as_bytes());
+}
+
+fn quoted(text: &String) -> Bytes
+  intent "Encode a string as a JSON string."
+  requires none
+  ensures none
+  effects none
+{
+  return scalar(JsonNode.Str(text.clone()));
+}
+
+fn text_bytes(text: &String) -> Bytes
+  intent "UTF-8 bytes of a string."
+  requires none
+  ensures none
+  effects none
+{
+  return text.as_bytes();
+}
+
+fn health_name(health: Health) -> String
+  intent "Wire name of a health inner."
+  requires none
+  ensures none
+  effects none
+{
+  return match health {
+    Health.Healthy => "healthy",
+    Health.Degraded => "degraded",
+    Health.Dead => "dead",
+  };
+}
+
+fn reason_name(error: ObserveError) -> String
+  intent "Short stable reason of a rejected record."
+  requires none
+  ensures none
+  effects none
+{
+  return match error {
+    ObserveError.InvalidTimestamp => "invalid_timestamp",
+    ObserveError.InvalidComponent => "invalid_component",
+    ObserveError.InvalidTraceId => "invalid_trace_id",
+    ObserveError.InvalidJson => "invalid_json",
+    ObserveError.LogTooLarge => "line_too_large",
+    ObserveError.InvalidMetricName => "invalid_metric_name",
+    ObserveError.InvalidLabels => "invalid_labels",
+    ObserveError.InvalidNumber => "invalid_number",
+    ObserveError.InvalidBuckets => "invalid_buckets",
+    ObserveError.Overflow => "overflow",
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Storage and heartbeats
+
+fn heartbeat_component(line: &Line) -> Option<String>
+  intent "The component of a heartbeat_ping metric sample, if the record is one."
+  requires none
+  ensures none
+  effects none
+{
+  let parsed = json.parse(&line.ndjson()).ok()?;
+  let nodes = parsed.nodes();
+  let mut name = "";
+  let mut component = "";
+  let mut metric = false;
+  match nodes.get(parsed.root()) {
+    Some(JsonNode.Object(fields)) => {
+      let mut i = 0;
+      while i < fields.len() {
+        match fields.get(i) {
+          Some(item) => {
+            let key = item.name();
+            if key == "labels" {
+              metric = true;
+            }
+            match nodes.get(item.index()) {
+              Some(JsonNode.Str(text)) => {
+                if key == "name" {
+                  name = text.clone();
+                }
+                if key == "component" {
+                  component = text.clone();
+                }
+              }
+              _ => {}
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    _ => {}
+  }
+  if metric && name == "heartbeat_ping" {
+    return Some(component);
+  }
+  return None;
+}
+
+fn note_beat(inner: &mut State, config: &ReceiverConfig, component: &String, now: Int)
+  intent "Record a heartbeat, adding the component when there is room."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < inner.beats.len() {
+    match inner.beats.get_mut(i) {
+      Some(beat) => {
+        if beat.component == component {
+          let _ = beat.heartbeat.ping(now);
+          return;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  if inner.beats.len() >= config.max_components {
+    return;
+  }
+  match default_heartbeat(now) {
+    Ok(started) => {
+      inner.beats.push(Beat { component: component.clone(), heartbeat: started });
+    }
+    Err(error) => {}
+  }
+}
+
+fn store_one(inner: &mut State, line: &Line) -> Result<Bool, DbError>
+  intent "Store a single record in its own transaction."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut single = batch(70000)?;
+  single.append(&line)?;
+  let written = single.flush(&mut inner.database)?;
+  return Ok(written == 1);
+}
+
+fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, observed: Int) -> Result<Stored, DbError>
+  intent "Store a request's records; a duplicate metric sample falls back to per-record transactions."
+  requires none
+  ensures none
+  effects fs
+{
+  let now = state_time(&mut inner, observed);
+  let mut pending = batch(lines.len() * 65536 + 1)?;
+  let mut i = 0;
+  while i < lines.len() {
+    match lines.get(i) {
+      Some(line) => {
+        pending.append(&line)?;
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  let mut accepted = 0;
+  let mut duplicates = 0;
+  match pending.flush(&mut inner.database) {
+    Ok(count) => {
+      accepted = count;
+    }
+    Err(error) => {
+      if !is_duplicate_key(&error) {
+        pending.clear();
+        return Err(error);
+      }
+      pending.clear();
+      let mut j = 0;
+      while j < lines.len() {
+        match lines.get(j) {
+          Some(line) => {
+            match store_one(&mut inner, &line) {
+              Ok(done) => {
+                accepted = accepted + 1;
+              }
+              Err(single_error) => {
+                if is_duplicate_key(&single_error) {
+                  duplicates = duplicates + 1;
+                } else {
+                  return Err(single_error);
+                }
+              }
+            }
+          }
+          None => {}
+        }
+        j = j + 1;
+      }
+    }
+  }
+  let mut k = 0;
+  while k < lines.len() {
+    match lines.get(k) {
+      Some(line) => {
+        match heartbeat_component(&line) {
+          Some(component) => {
+            note_beat(&mut inner, &config, &component, now);
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    k = k + 1;
+  }
+  return Ok(Stored { accepted: accepted, duplicates: duplicates });
+}
+
+fn commit(hub: &Hub, lines: &List<Line>) -> Result<Stored, DbError>
+  intent "Take the inner lock and store the validated records."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let observed = raw_now(&hub.config);
+  match hub.inner.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let inner = held.get_mut();
+      return store_lines(&mut inner, &hub.config, &lines, observed);
+    }
+    Err(error) => {
+      return Err(DbError.Corrupt("inner lock unavailable"));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// HTTP parsing
+
+fn part_at(list: &List<Bytes>, index: Int) -> Bytes
+  intent "One element of a list of byte strings, or empty bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(index) {
+    Some(item) => item.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn text_at(list: &List<String>, index: Int) -> String
+  intent "One element of a list of strings, or an empty string."
+  requires none
+  ensures none
+  effects none
+{
+  return match list.get(index) {
+    Some(item) => item.clone(),
+    None => "",
+  };
+}
+
+fn find_head_end(buf: &Bytes) -> Int
+  intent "Index of the CRLF CRLF that ends the request head, or -1."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i + 3 < buf.byte_len() {
+    if buf.get(i).unwrap_or(0) == 13 && buf.get(i + 1).unwrap_or(0) == 10 && buf.get(i + 2).unwrap_or(0) == 13 && buf.get(i + 3).unwrap_or(0) == 10 {
+      return i;
+    }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn lower_ascii(c: Int) -> Int
+  intent "ASCII lower-case of one byte."
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 65 && c <= 90 {
+    return c + 32;
+  }
+  return c;
+}
+
+fn split_lines(text: &Bytes) -> List<Bytes>
+  intent "Split on LF, dropping one trailing CR from each part."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  let mut start = 0;
+  let mut i = 0;
+  while i <= text.byte_len() {
+    if i == text.byte_len() || text.get(i).unwrap_or(0) == 10 {
+      let mut end = i;
+      if end > start && text.get(end - 1).unwrap_or(0) == 13 {
+        end = end - 1;
+      }
+      parts.push(text.slice(start, end).unwrap_or(Bytes.new()));
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return parts;
+}
+
+fn split_on(text: &Bytes, separator: Int) -> List<Bytes>
+  intent "Split on one separator byte."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  let mut start = 0;
+  let mut i = 0;
+  while i <= text.byte_len() {
+    if i == text.byte_len() || text.get(i).unwrap_or(0) == separator {
+      parts.push(text.slice(start, i).unwrap_or(Bytes.new()));
+      start = i + 1;
+    }
+    i = i + 1;
+  }
+  return parts;
+}
+
+fn parse_number(text: &Bytes) -> Int
+  intent "A decimal number of at most ten digits, or -1."
+  requires none
+  ensures none
+  effects none
+{
+  if text.byte_len() == 0 || text.byte_len() > 10 {
+    return -1;
+  }
+  let mut value = 0;
+  let mut i = 0;
+  while i < text.byte_len() {
+    let c = text.get(i).unwrap_or(0);
+    if c < 48 || c > 57 {
+      return -1;
+    }
+    value = value * 10 + c - 48;
+    i = i + 1;
+  }
+  return value;
+}
+
+fn hex_value(c: Int) -> Int
+  intent "Value of one hexadecimal digit, or -1."
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return c - 48;
+  }
+  if c >= 97 && c <= 102 {
+    return c - 87;
+  }
+  if c >= 65 && c <= 70 {
+    return c - 55;
+  }
+  return -1;
+}
+
+fn percent_decode(text: &Bytes) -> String
+  intent "Decode %XX and + in a query value; malformed escapes stay literal."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < text.byte_len() {
+    let c = text.get(i).unwrap_or(0);
+    if c == 43 {
+      out.push(32);
+    } else if c == 37 && i + 2 < text.byte_len() + 0 && hex_value(text.get(i + 1).unwrap_or(0)) >= 0 && hex_value(text.get(i + 2).unwrap_or(0)) >= 0 {
+      out.push(hex_value(text.get(i + 1).unwrap_or(0)) * 16 + hex_value(text.get(i + 2).unwrap_or(0)));
+      i = i + 2;
+    } else {
+      out.push(c);
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn query_value(query: &String, name: &String) -> Option<String>
+  intent "The decoded value of one query parameter."
+  requires none
+  ensures none
+  effects none
+{
+  let pairs = split_on(&query.as_bytes(), 38);
+  let mut i = 0;
+  while i < pairs.len() {
+    match pairs.get(i) {
+      Some(pair) => {
+        let parts = split_on(&pair, 61);
+        match parts.get(0) {
+          Some(key) => {
+            if key.to_string_utf8().unwrap_or("") == name && parts.len() >= 2 {
+              let mut value = Bytes.new();
+              let mut j = 1;
+              while j < parts.len() {
+                if j > 1 {
+                  value.push(61);
+                }
+                value.extend(&part_at(&parts, j));
+                j = j + 1;
+              }
+              return Some(percent_decode(&value));
+            }
+          }
+          None => {}
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn header_is(name: &Bytes, wanted: &String) -> Bool
+  intent "Case-insensitive header name match."
+  requires none
+  ensures none
+  effects none
+{
+  let target = wanted.as_bytes();
+  if name.byte_len() != target.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < name.byte_len() {
+    if lower_ascii(name.get(i).unwrap_or(0)) != target.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn trim_spaces(text: &Bytes) -> Bytes
+  intent "Strip leading and trailing spaces."
+  requires none
+  ensures none
+  effects none
+{
+  let mut start = 0;
+  let mut end = text.byte_len();
+  while start < end && text.get(start).unwrap_or(0) == 32 {
+    start = start + 1;
+  }
+  while end > start && text.get(end - 1).unwrap_or(0) == 32 {
+    end = end - 1;
+  }
+  return text.slice(start, end).unwrap_or(Bytes.new());
+}
+
+fn read_chunk(stream: &TcpStream, carry: &mut Bytes) -> Bool
+  intent "Append one received chunk to the carry buffer; false on EOF or error."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  match stream.read(4096) {
+    Ok(piece) => {
+      if piece.byte_len() == 0 {
+        return false;
+      }
+      carry.extend(&piece);
+      return true;
+    }
+    Err(error) => {
+      return false;
+    }
+  }
+}
+
+fn read_request(stream: &TcpStream, config: &ReceiverConfig, start: &Bytes) -> Result<Req, Int>
+  intent "Read one HTTP request with bounded head and body; Err carries the status to answer, 0 to just close."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut carry = start.clone();
+  let mut end = find_head_end(&carry);
+  while end < 0 {
+    if carry.byte_len() > 8192 {
+      return Err(431);
+    }
+    if !read_chunk(&stream, &mut carry) {
+      return Err(0);
+    }
+    end = find_head_end(&carry);
+  }
+  if end > 8192 {
+    return Err(431);
+  }
+  let head = carry.slice(0, end).unwrap_or(Bytes.new());
+  let rest = carry.slice(end + 4, carry.byte_len()).unwrap_or(Bytes.new());
+  let lines = split_lines(&head);
+  let first = split_on(&part_at(&lines, 0), 32);
+  if first.len() != 3 {
+    return Err(400);
+  }
+  let method = part_at(&first, 0).to_string_utf8().unwrap_or("");
+  let target = part_at(&first, 1);
+  let version = part_at(&first, 2).to_string_utf8().unwrap_or("");
+  if version != "HTTP/1.1" && version != "HTTP/1.0" {
+    return Err(505);
+  }
+  let mut keep = version == "HTTP/1.1";
+  let mut length = 0;
+  let mut index = 1;
+  while index < lines.len() {
+    let line = part_at(&lines, index);
+    let parts = split_on(&line, 58);
+    if parts.len() >= 2 {
+      let name = part_at(&parts, 0);
+      let mut value = Bytes.new();
+      let mut j = 1;
+      while j < parts.len() {
+        if j > 1 {
+          value.push(58);
+        }
+        value.extend(&part_at(&parts, j));
+        j = j + 1;
+      }
+      let trimmed = trim_spaces(&value);
+      if header_is(&name, &"content-length") {
+        length = parse_number(&trimmed);
+        if length < 0 {
+          return Err(400);
+        }
+      }
+      if header_is(&name, &"transfer-encoding") {
+        return Err(501);
+      }
+      if header_is(&name, &"connection") {
+        let text = trimmed.to_string_utf8().unwrap_or("");
+        if text == "close" || text == "Close" {
+          keep = false;
+        }
+      }
+    }
+    index = index + 1;
+  }
+  if length > config.max_body_bytes {
+    return Err(413);
+  }
+  let mut body = rest;
+  while body.byte_len() < length {
+    if !read_chunk(&stream, &mut body) {
+      return Err(0);
+    }
+  }
+  let mut extra = Bytes.new();
+  if body.byte_len() > length {
+    extra = body.slice(length, body.byte_len()).unwrap_or(Bytes.new());
+    body = body.slice(0, length).unwrap_or(Bytes.new());
+  }
+  let target_parts = split_on(&target, 63);
+  let path = part_at(&target_parts, 0).to_string_utf8().unwrap_or("");
+  let mut query_bytes = Bytes.new();
+  let mut part = 1;
+  while part < target_parts.len() {
+    if part > 1 {
+      query_bytes.push(63);
+    }
+    query_bytes.extend(&part_at(&target_parts, part));
+    part = part + 1;
+  }
+  return Ok(Req { method: method, path: path, query: query_bytes.to_string_utf8().unwrap_or(""), body: body, keep: keep, extra: extra });
+}
+
+fn reason_phrase(status: Int) -> String
+  intent "Reason phrase of a status code."
+  requires none
+  ensures none
+  effects none
+{
+  return match status {
+    200 => "OK",
+    400 => "Bad Request",
+    404 => "Not Found",
+    405 => "Method Not Allowed",
+    413 => "Payload Too Large",
+    422 => "Unprocessable Entity",
+    431 => "Request Header Fields Too Large",
+    501 => "Not Implemented",
+    503 => "Service Unavailable",
+    505 => "HTTP Version Not Supported",
+    _ => "Error",
+  };
+}
+
+fn respond(stream: &TcpStream, status: Int, body: &Bytes, keep: Bool, timeout_ms: Int) -> Bool
+  intent "Write one JSON response within the I/O deadline."
+  requires none
+  ensures none
+  effects clock, net.server, task.spawn, task.suspend
+{
+  let mut head = Bytes.new();
+  head.extend(&"HTTP/1.1 ".as_bytes());
+  head.extend(&scalar(JsonNode.Int(status)));
+  head.push(32);
+  head.extend(&reason_phrase(status).as_bytes());
+  head.extend(&"\r\nContent-Type: application/json\r\nContent-Length: ".as_bytes());
+  head.extend(&scalar(JsonNode.Int(body.byte_len())));
+  if keep {
+    head.extend(&"\r\nConnection: keep-alive\r\n\r\n".as_bytes());
+  } else {
+    head.extend(&"\r\nConnection: close\r\n\r\n".as_bytes());
+  }
+  head.extend(&body);
+  return match task.timeout(timeout_ms, || stream.write_all(&head)) {
+    Some(written) => written.is_ok(),
+    None => false,
+  };
+}
+
+fn error_body(reason: &String) -> Bytes
+  intent "A JSON error object."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = "{\"error\":".as_bytes();
+  out.extend(&quoted(&reason));
+  out.push(125);
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Ingest
+
+fn validate_lines(rows: &List<Bytes>, accepted: &mut List<Line>, reasons: &mut List<String>) -> Int
+  intent "Validate every non-empty row; returns the number rejected."
+  requires none
+  ensures none
+  effects none
+{
+  let mut rejected = 0;
+  let mut i = 0;
+  while i < rows.len() {
+    match rows.get(i) {
+      Some(row) => {
+        if row.byte_len() > 0 {
+          match row.to_string_utf8() {
+            Ok(text) => {
+              match accept_line(&text) {
+                Ok(line) => {
+                  accepted.push(line);
+                }
+                Err(error) => {
+                  rejected = rejected + 1;
+                  reasons.push(reason_name(error));
+                }
+              }
+            }
+            Err(cause) => {
+              rejected = rejected + 1;
+              reasons.push("invalid_json");
+            }
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return rejected;
+}
+
+fn ingest_body(hub: &Hub, body: &Bytes) -> Bytes
+  intent "Handle POST /ingest and return the JSON body; the first byte of a 5xx body is never read as success."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let rows = split_lines(&body);
+  let mut valid = List.new();
+  let mut reasons = List.new();
+  let rejected = validate_lines(&rows, &mut valid, &mut reasons);
+  let mut accepted = 0;
+  let mut duplicates = 0;
+  if valid.len() > 0 {
+    match commit(&hub, &valid) {
+      Ok(stored) => {
+        accepted = stored.accepted;
+        duplicates = stored.duplicates;
+      }
+      Err(error) => {
+        return error_body(&"storage_failed");
+      }
+    }
+  }
+  let mut out = "{\"accepted\":".as_bytes();
+  out.extend(&scalar(JsonNode.Int(accepted)));
+  out.extend(&",\"rejected\":".as_bytes());
+  out.extend(&scalar(JsonNode.Int(rejected + duplicates)));
+  out.extend(&",\"reasons\":[".as_bytes());
+  let mut i = 0;
+  while i < reasons.len() && i < 10 {
+    if i > 0 {
+      out.push(44);
+    }
+    out.extend(&quoted(&text_at(&reasons, i)));
+    i = i + 1;
+  }
+  out.extend(&"]}".as_bytes());
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Query API
+
+fn int_param(query: &String, name: &String, fallback: Int, limit: Int) -> Int
+  intent "A bounded integer query parameter."
+  requires none
+  ensures none
+  effects none
+{
+  let mut base = fallback;
+  if base > limit {
+    base = limit;
+  }
+  match query_value(&query, &name) {
+    Some(text) => {
+      let value = parse_number(&text.as_bytes());
+      if value < 0 {
+        return base;
+      }
+      if value > limit {
+        return limit;
+      }
+      return value;
+    }
+    None => {}
+  }
+  return base;
+}
+
+fn query_logs(hub: &Hub, query: &String) -> Result<Bytes, Int>
+  intent "GET /api/logs: newest matching log records."
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  let limit = int_param(&query, &"limit", 100, hub.config.query_max);
+  let filter = log_filter(query_value(&query, &"component"), query_value(&query, &"level"), query_value(&query, &"since"), query_value(&query, &"until"), query_value(&query, &"prefix"));
+  match hub.inner.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let inner = held.get_mut();
+      match recent_logs(&mut inner.database, &filter, limit, hub.config.scan_limit) {
+        Ok(found) => {
+          let mut out = "{\"logs\":[".as_bytes();
+          let mut i = 0;
+          while i < found.len() {
+            if i > 0 {
+              out.push(44);
+            }
+            out.extend(&text_at(&found, i).as_bytes());
+            i = i + 1;
+          }
+          out.extend(&"],\"count\":".as_bytes());
+          out.extend(&scalar(JsonNode.Int(found.len())));
+          out.push(125);
+          return Ok(out);
+        }
+        Err(error) => {
+          return Err(503);
+        }
+      }
+    }
+    Err(error) => {
+      return Err(503);
+    }
+  }
+}
+
+fn query_metrics(hub: &Hub, query: &String) -> Result<Bytes, Int>
+  intent "GET /api/metrics: count, sum, min, max and latest value of one component's metric."
+  requires none
+  ensures none
+  effects fs, task.share, task.suspend
+{
+  let component = query_value(&query, &"component").ok_or(400)?;
+  let name = query_value(&query, &"name").ok_or(400)?;
+  let since = query_value(&query, &"since");
+  let until = query_value(&query, &"until");
+  match hub.inner.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let inner = held.get_mut();
+      match metric_summary(&mut inner.database, &component, &name, &since, &until, hub.config.scan_limit) {
+        Ok(summary) => {
+          let mut out = "{\"component\":".as_bytes();
+          out.extend(&quoted(&component));
+          out.extend(&",\"name\":".as_bytes());
+          out.extend(&quoted(&name));
+          out.extend(&",\"samples\":".as_bytes());
+          out.extend(&scalar(JsonNode.Int(summary.samples)));
+          out.extend(&",\"sum\":".as_bytes());
+          out.extend(&scalar(JsonNode.Float(summary.sum)));
+          out.extend(&",\"min\":".as_bytes());
+          out.extend(&scalar(JsonNode.Float(summary.min)));
+          out.extend(&",\"max\":".as_bytes());
+          out.extend(&scalar(JsonNode.Float(summary.max)));
+          out.extend(&",\"last\":".as_bytes());
+          out.extend(&scalar(JsonNode.Float(summary.last)));
+          out.extend(&",\"last_ts\":".as_bytes());
+          out.extend(&quoted(&summary.last_ts));
+          out.extend(&",\"scanned\":".as_bytes());
+          out.extend(&scalar(JsonNode.Int(summary.scanned)));
+          if summary.complete {
+            out.extend(&",\"complete\":true}".as_bytes());
+          } else {
+            out.extend(&",\"complete\":false}".as_bytes());
+          }
+          return Ok(out);
+        }
+        Err(error) => {
+          return Err(503);
+        }
+      }
+    }
+    Err(error) => {
+      return Err(503);
+    }
+  }
+}
+
+fn query_components(hub: &Hub) -> Result<Bytes, Int>
+  intent "GET /api/components: heartbeat inner of every component that has sent heartbeat_ping."
+  requires none
+  ensures none
+  effects clock, task.share, task.suspend
+{
+  let observed = raw_now(&hub.config);
+  match hub.inner.acquire() {
+    Ok(guard) => {
+      let mut held = guard;
+      let inner = held.get_mut();
+      let now = state_time(&mut inner, observed);
+      let mut out = "{\"components\":[".as_bytes();
+      let mut i = 0;
+      while i < inner.beats.len() {
+        match inner.beats.get(i) {
+          Some(beat) => {
+            if i > 0 {
+              out.push(44);
+            }
+            out.extend(&"{\"component\":".as_bytes());
+            out.extend(&quoted(&beat.component));
+            out.extend(&",\"status\":".as_bytes());
+            out.extend(&quoted(&health_name(beat.heartbeat.status(now))));
+            out.extend(&",\"source\":\"heartbeat\"}".as_bytes());
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      out.extend(&"]}".as_bytes());
+      return Ok(out);
+    }
+    Err(error) => {
+      return Err(503);
+    }
+  }
+}
+
+fn route(hub: &Hub, request: &Req) -> Result<Bytes, Int>
+  intent "Dispatch one request; Err carries the status code of the failure."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  if request.path == "/healthz" && request.method == "GET" {
+    return Ok("{\"status\":\"ok\"}".as_bytes());
+  }
+  if request.path == "/ingest" {
+    if request.method != "POST" {
+      return Err(405);
+    }
+    return Ok(ingest_body(&hub, &request.body));
+  }
+  if request.path == "/api/logs" || request.path == "/api/metrics" || request.path == "/api/components" {
+    if request.method != "GET" {
+      return Err(405);
+    }
+    if request.path == "/api/logs" {
+      return query_logs(&hub, &request.query);
+    }
+    if request.path == "/api/metrics" {
+      return query_metrics(&hub, &request.query);
+    }
+    return query_components(&hub);
+  }
+  return Err(404);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Sessions
+
+fn serve_http(session: &Session, first: &Bytes)
+  intent "Serve HTTP requests on one connection until it closes, times out or exceeds a limit."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let hub = session.hub.borrow();
+  let timeout_ms = hub.config.io_timeout_ms;
+  let mut carry = first.clone();
+  let mut served = 0;
+  while served < hub.config.max_requests {
+    let read = task.timeout(timeout_ms, || read_request(&session.stream, &hub.config, &carry));
+    match read {
+      None => {
+        return;
+      }
+      Some(outcome) => {
+        match outcome {
+          Err(status) => {
+            if status > 0 {
+              let sent = respond(&session.stream, status, &error_body(&reason_phrase(status)), false, timeout_ms);
+            }
+            return;
+          }
+          Ok(request) => {
+            carry = request.extra.clone();
+            served = served + 1;
+            let mut keep = request.keep && served < hub.config.max_requests;
+            let mut status = 200;
+            let mut body = Bytes.new();
+            match route(&hub, &request) {
+              Ok(found) => {
+                body = found;
+                if request.path == "/ingest" && body.byte_len() > 9 && body.get(2).unwrap_or(0) == 101 {
+                  status = 503;
+                }
+              }
+              Err(code) => {
+                status = code;
+                body = error_body(&reason_phrase(code));
+              }
+            }
+            if !respond(&session.stream, status, &body, keep, timeout_ms) || !keep {
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn raw_line_reply(hub: &Hub, row: &Bytes) -> Bytes
+  intent "Validate and store one raw TCP record; the reply is one line."
+  requires none
+  ensures none
+  effects clock, fs, task.share, task.suspend
+{
+  let mut reasons = List.new();
+  let mut valid = List.new();
+  let mut rows = List.new();
+  rows.push(row.clone());
+  let rejected = validate_lines(&rows, &mut valid, &mut reasons);
+  if rejected > 0 {
+    let mut out = "ERR ".as_bytes();
+    out.extend(&text_at(&reasons, 0).as_bytes());
+    out.push(10);
+    return out;
+  }
+  if valid.len() == 0 {
+    return "OK\n".as_bytes();
+  }
+  match commit(&hub, &valid) {
+    Ok(stored) => {
+      if stored.accepted > 0 {
+        return "OK\n".as_bytes();
+      }
+      return "ERR duplicate\n".as_bytes();
+    }
+    Err(error) => {
+      return "ERR storage_failed\n".as_bytes();
+    }
+  }
+}
+
+fn read_raw_line(stream: &TcpStream, start: &Bytes) -> Result<RawRead, Int>
+  intent "Read up to the next LF; a line over 64 KB is an error (1), EOF or a socket error is 0."
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut carry = start.clone();
+  while true {
+    let mut i = 0;
+    while i < carry.byte_len() {
+      if carry.get(i).unwrap_or(0) == 10 {
+        let mut end = i;
+        if end > 0 && carry.get(end - 1).unwrap_or(0) == 13 {
+          end = end - 1;
+        }
+        let line = carry.slice(0, end).unwrap_or(Bytes.new());
+        let rest = carry.slice(i + 1, carry.byte_len()).unwrap_or(Bytes.new());
+        return Ok(RawRead { line: line, rest: rest });
+      }
+      i = i + 1;
+    }
+    if carry.byte_len() >= 65536 {
+      return Err(1);
+    }
+    if !read_chunk(&stream, &mut carry) {
+      return Err(0);
+    }
+  }
+  return Err(0);
+}
+
+fn serve_raw(session: &Session, first: &Bytes)
+  intent "Serve a raw NDJSON stream: one reply line per record, bounded records and time per line."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let hub = session.hub.borrow();
+  let timeout_ms = hub.config.io_timeout_ms;
+  let mut carry = first.clone();
+  let mut served = 0;
+  while served < hub.config.max_requests {
+    let read = task.timeout(timeout_ms, || read_raw_line(&session.stream, &carry));
+    match read {
+      None => {
+        return;
+      }
+      Some(outcome) => {
+        match outcome {
+          Err(code) => {
+            if code == 1 {
+              let sent = task.timeout(timeout_ms, || session.stream.write_all(&"ERR line_too_large\n".as_bytes()));
+            }
+            return;
+          }
+          Ok(row) => {
+            carry = row.rest.clone();
+            served = served + 1;
+            let reply = raw_line_reply(&hub, &row.line);
+            let sent = task.timeout(timeout_ms, || session.stream.write_all(&reply));
+            match sent {
+              Some(written) => {
+                if written.is_err() {
+                  return;
+                }
+              }
+              None => {
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn serve_session(session: &Session)
+  intent "Tell raw NDJSON from HTTP by the first byte, then serve the connection."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let hub = session.hub.borrow();
+  let timeout_ms = hub.config.io_timeout_ms;
+  let mut first = Bytes.new();
+  let got = task.timeout(timeout_ms, || read_chunk(&session.stream, &mut first));
+  match got {
+    Some(true) => {}
+    _ => {
+      return;
+    }
+  }
+  if first.get(0).unwrap_or(0) == 123 {
+    serve_raw(&session, &first);
+  } else {
+    serve_http(&session, &first);
+  }
+}
+
+pub fn serve(listener: &TcpListener, hub: &SyncShared<Hub>) -> Int
+  intent "Accept connections forever, each as an isolated root task; returns only if the accept loop is cancelled."
+  requires none
+  ensures none
+  effects clock, fs, net.server, task
+{
+  let limit = hub.borrow().config.max_connections;
+  return task.roots(limit, |group| {
+    while true {
+      let slot = group.reserve();
+      match listener.accept() {
+        Ok(stream) => {
+          slot.start(Session { stream: stream, hub: hub.clone() }, move |session| {
+            serve_session(&session);
+          }, move |session| {});
+        }
+        Err(error) => {
+          task.sleep(10);
+        }
+      }
+    }
+    return 0;
+  });
+}

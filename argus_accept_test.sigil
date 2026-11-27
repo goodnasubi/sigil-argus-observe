@@ -1,0 +1,281 @@
+module argus_accept_test
+  targets server
+  trust none
+
+use argus_observe.Line;
+use argus_observe.ObserveError;
+use argus_observe.accept_line;
+
+// Contract tests of argus_observe.accept_line, the validation every received record passes (ADR 0067 decisions 2, 3).
+// main returns 0, or the number of the first failed check.
+
+fn text_of(line: &Result<Line, ObserveError>) -> String
+  intent "The canonical JSON of an accepted record, or an empty string."
+  requires none
+  ensures none
+  effects none
+{
+  return match line {
+    Ok(found) => found.ndjson().to_string_utf8().unwrap_or(""),
+    Err(error) => "",
+  };
+}
+
+fn rejected_as(outcome: Result<Line, ObserveError>, expected: ObserveError) -> Bool
+  intent "True when the record was refused with exactly the expected reason."
+  requires none
+  ensures none
+  effects none
+{
+  return match outcome {
+    Ok(found) => false,
+    Err(error) => reason(error) == reason(expected),
+  };
+}
+
+fn reason(error: ObserveError) -> Int
+  intent "A number per refusal reason."
+  requires none
+  ensures none
+  effects none
+{
+  return match error {
+    ObserveError.InvalidTimestamp => 1,
+    ObserveError.InvalidComponent => 2,
+    ObserveError.InvalidTraceId => 3,
+    ObserveError.InvalidJson => 4,
+    ObserveError.LogTooLarge => 5,
+    ObserveError.InvalidMetricName => 6,
+    ObserveError.InvalidLabels => 7,
+    ObserveError.InvalidNumber => 8,
+    ObserveError.InvalidBuckets => 9,
+    ObserveError.Overflow => 10,
+  };
+}
+
+fn filled(count: Int) -> String
+  intent "count ASCII letters."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(count);
+  let mut i = 0;
+  while i < count {
+    out.push(97);
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+fn wrap(parts: &List<String>) -> String
+  intent "Concatenate strings."
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  let mut i = 0;
+  while i < parts.len() {
+    match parts.get(i) {
+      Some(part) => {
+        out.extend(&part.as_bytes());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out.to_string_utf8().unwrap_or("");
+}
+
+pub fn main() -> Int
+  intent "Run the accept_line contract tests."
+  requires none
+  ensures none
+  effects none
+{
+  // A log round-trips to its canonical spelling; unknown members are dropped; context is kept.
+  let log = accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"WARN\",\"msg\":\"a\\nb\",\"extra\":1,\"trace_id\":\"abc123\",\"fields\":{\"k\":[1,2]}}");
+  if text_of(&log) != "{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"WARN\",\"trace_id\":\"abc123\",\"fields\":{\"k\":[1,2]},\"msg\":\"a b\"}\n" {
+    return 1;
+  }
+  // The canonical form is a fixed point.
+  if text_of(&accept_line(&text_of(&log).as_bytes().to_string_utf8().unwrap_or(""))) != text_of(&log) {
+    return 2;
+  }
+  // Metrics: the component label is forced to the source component; value spellings are kept as numbers.
+  let metric = accept_line(&"{\"ts\":\"2026-11-27T10:00:00.123456Z\",\"component\":\"sigil-alpha\",\"name\":\"queue_depth\",\"type\":\"gauge\",\"value\":4,\"labels\":{\"component\":\"someone-else\",\"queue\":\"jobs\"}}");
+  if text_of(&metric) != "{\"ts\":\"2026-11-27T10:00:00.123456Z\",\"component\":\"sigil-alpha\",\"name\":\"queue_depth\",\"type\":\"gauge\",\"value\":4,\"labels\":{\"component\":\"sigil-alpha\",\"queue\":\"jobs\"}}\n" {
+    return 3;
+  }
+  if text_of(&accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x_total\",\"type\":\"counter\",\"value\":2.5,\"labels\":{}}")) == "" {
+    return 4;
+  }
+  // Refusals, each with its reason.
+  if !rejected_as(accept_line(&"[]"), ObserveError.InvalidJson) {
+    return 10;
+  }
+  if !rejected_as(accept_line(&"not json"), ObserveError.InvalidJson) {
+    return 11;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-13-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":\"x\"}"), ObserveError.InvalidTimestamp) {
+    return 12;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"Sigil_Alpha\",\"level\":\"INFO\",\"msg\":\"x\"}"), ObserveError.InvalidComponent) {
+    return 13;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"info\",\"msg\":\"x\"}"), ObserveError.InvalidJson) {
+    return 14;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\"}"), ObserveError.InvalidJson) {
+    return 15;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":\"x\",\"trace_id\":\"zz\"}"), ObserveError.InvalidTraceId) {
+    return 16;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":5}"), ObserveError.InvalidJson) {
+    return 17;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"Bad\",\"type\":\"gauge\",\"value\":1,\"labels\":{}}"), ObserveError.InvalidMetricName) {
+    return 18;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"timer\",\"value\":1,\"labels\":{}}"), ObserveError.InvalidJson) {
+    return 19;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"gauge\",\"value\":\"1\",\"labels\":{}}"), ObserveError.InvalidNumber) {
+    return 20;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"gauge\",\"labels\":{}}"), ObserveError.InvalidNumber) {
+    return 21;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"gauge\",\"value\":1,\"labels\":{\"a\":1}}"), ObserveError.InvalidLabels) {
+    return 22;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"gauge\",\"value\":1,\"labels\":[]}"), ObserveError.InvalidLabels) {
+    return 23;
+  }
+  // Ten labels in all (the forced component plus nine of the sender's) are allowed; a tenth sender label is not.
+  if text_of(&accept_line(&metric_with(9))) == "" {
+    return 30;
+  }
+  if !rejected_as(accept_line(&metric_with(10)), ObserveError.InvalidLabels) {
+    return 31;
+  }
+  // The 64 KB line limit: refused before parsing, with no allocation proportional to the claim.
+  if !rejected_as(accept_line(&wrap_one(&filled(70000))), ObserveError.LogTooLarge) {
+    return 32;
+  }
+  // Normalization copies the component into the labels: a 40,000-letter component fits as received (about 40 KB)
+  // but not as the canonical record (about 80 KB), so it is refused after normalizing.
+  if !rejected_as(accept_line(&wide_component(40000)), ObserveError.LogTooLarge) {
+    return 33;
+  }
+  if text_of(&accept_line(&wide_component(20000))) == "" {
+    return 34;
+  }
+  // A truncation marker set by the producer is kept; the canonical record stays within 64 KB.
+  let marked = accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"cut\"}");
+  if text_of(&marked) != "{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"cut\"}\n" {
+    return 35;
+  }
+  if text_of(&accept_line(&text_of(&marked))) != text_of(&marked) {
+    return 36;
+  }
+  if text_of(&accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":false,\"msg\":\"whole\"}")) != "{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":\"whole\"}\n" {
+    return 37;
+  }
+  if !rejected_as(accept_line(&"{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":\"yes\",\"msg\":\"x\"}"), ObserveError.InvalidJson) {
+    return 38;
+  }
+  let big_marked = text_of(&accept_line(&marked_with(65380)));
+  if big_marked == "" || big_marked.as_bytes().byte_len() > 65536 || !has_marker(&big_marked) {
+    return 39;
+  }
+  return 0;
+}
+
+fn has_marker(text: &String) -> Bool
+  intent "True when the record carries the truncation marker."
+  requires none
+  ensures none
+  effects none
+{
+  let hay = text.as_bytes();
+  let want = "\"truncated\":true".as_bytes();
+  let mut i = 0;
+  while i + want.byte_len() <= hay.byte_len() {
+    let mut j = 0;
+    while j < want.byte_len() && hay.get(i + j).unwrap_or(0) == want.get(j).unwrap_or(1) {
+      j = j + 1;
+    }
+    if j == want.byte_len() {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn marked_with(count: Int) -> String
+  intent "A log record that a producer marked truncated, with a message of count letters."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"truncated\":true,\"msg\":\"");
+  parts.push(filled(count));
+  parts.push("\"}");
+  return wrap(&parts);
+}
+
+fn wide_component(count: Int) -> String
+  intent "A gauge sample from a component name of count letters with no labels."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"");
+  parts.push(filled(count));
+  parts.push("\",\"name\":\"x\",\"type\":\"gauge\",\"value\":1,\"labels\":{}}");
+  return wrap(&parts);
+}
+
+fn wrap_one(text: &String) -> String
+  intent "A syntactically valid log record around one message."
+  requires none
+  ensures none
+  effects none
+{
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"level\":\"INFO\",\"msg\":\"");
+  parts.push(text.clone());
+  parts.push("\"}");
+  return wrap(&parts);
+}
+
+fn metric_with(count: Int) -> String
+  intent "A gauge sample with count sender labels named a, b, c, ..."
+  requires none
+  ensures none
+  effects none
+{
+  let names = "abcdefghijklmnop".as_bytes();
+  let mut parts = List.new();
+  parts.push("{\"ts\":\"2026-11-27T10:00:00.000Z\",\"component\":\"sigil-alpha\",\"name\":\"x\",\"type\":\"gauge\",\"value\":1,\"labels\":{");
+  let mut i = 0;
+  while i < count {
+    if i > 0 {
+      parts.push(",");
+    }
+    let mut key = Bytes.new();
+    key.push(names.get(i).unwrap_or(122));
+    parts.push("\"");
+    parts.push(key.to_string_utf8().unwrap_or("z"));
+    parts.push("\":\"v\"");
+    i = i + 1;
+  }
+  parts.push("}}");
+  return wrap(&parts);
+}

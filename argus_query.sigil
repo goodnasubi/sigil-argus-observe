@@ -1,0 +1,382 @@
+module argus_query
+  targets server
+  trust none
+
+use db.database.Database;
+use db.database.Tx;
+use db.database.begin_tx;
+use db.database.tx_rollback;
+use db.error.DbError;
+use db.relation.ScanOrder;
+use db.relation.rel_get;
+use db.relation.rel_scan;
+use db.types.Value;
+use db.types.compare_bytes;
+use db.types.encode_value;
+
+// Read side of the stage 2 storage layout (argus_collect): recent log search and metric aggregation.
+// Every read is bounded by an explicit scan limit, so a query cannot walk the whole database.
+
+pub struct LogFilter {
+  component: Option<String>,
+  level: Option<String>,
+  since: Option<String>,
+  until: Option<String>,
+  prefix: Option<String>,
+}
+
+pub struct MetricSummary {
+  samples: Int,
+  sum: Float,
+  min: Float,
+  max: Float,
+  last: Float,
+  last_ts: String,
+  scanned: Int,
+  complete: Bool,
+}
+
+pub fn log_filter(component: Option<String>, level: Option<String>, since: Option<String>, until: Option<String>, prefix: Option<String>) -> LogFilter
+  intent "Collect the optional criteria of a log search."
+  requires none
+  ensures none
+  effects none
+{
+  return LogFilter { component: component, level: level, since: since, until: until, prefix: prefix };
+}
+
+fn pad_ts(ts: &String) -> String
+  intent "Spell a millisecond timestamp with microseconds, as the stored keys do."
+  requires none
+  ensures none
+  effects none
+{
+  let bytes = ts.as_bytes();
+  if bytes.byte_len() == 24 {
+    let mut padded = bytes.slice(0, 23).unwrap_or(Bytes.new());
+    padded.extend(&"000Z".as_bytes());
+    return padded.to_string_utf8().unwrap_or(ts.clone());
+  }
+  return ts.clone();
+}
+
+fn row_text(row: &List<Value>, index: Int) -> String
+  intent "Read a string column or an empty string."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.StrVal(text)) => text.clone(),
+    _ => "",
+  };
+}
+
+fn row_bytes(row: &List<Value>, index: Int) -> Bytes
+  intent "Read a bytes column or empty bytes."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.BytesVal(data)) => data.clone(),
+    _ => Bytes.new(),
+  };
+}
+
+fn row_int(row: &List<Value>, index: Int) -> Int
+  intent "Read an integer column or zero."
+  requires none
+  ensures none
+  effects none
+{
+  return match row.get(index) {
+    Some(Value.IntVal(number)) => number + 0,
+    _ => 0,
+  };
+}
+
+fn read_payload(database: &Database, tx: &mut Tx, key: &Value, chunks: Int) -> Result<Bytes, DbError>
+  intent "Reassemble the NDJSON bytes of one record from its payload chunks."
+  requires none
+  ensures none
+  effects fs
+{
+  let mut prefix = Bytes.new();
+  encode_value(&key, &mut prefix);
+  let mut data = Bytes.new();
+  let mut chunk = 0;
+  while chunk < chunks {
+    let mut chunk_key = prefix.clone();
+    chunk_key.push_u64_be(chunk);
+    match rel_get(&database, &mut tx, &"argus_payloads", &Value.BytesVal(chunk_key))? {
+      Some(row) => {
+        data.extend(&row_bytes(&row, 1));
+      }
+      None => {
+        return Err(DbError.Corrupt("missing payload chunk"));
+      }
+    }
+    chunk = chunk + 1;
+  }
+  return Ok(data);
+}
+
+fn in_range(ts: &String, since: &Option<String>, until: &Option<String>) -> Bool
+  intent "Check a stored timestamp against optional inclusive bounds."
+  requires none
+  ensures none
+  effects none
+{
+  match since {
+    Some(bound) => {
+      if compare_bytes(&ts.as_bytes(), &pad_ts(&bound).as_bytes()) < 0 {
+        return false;
+      }
+    }
+    None => {}
+  }
+  match until {
+    Some(bound) => {
+      if compare_bytes(&ts.as_bytes(), &pad_ts(&bound).as_bytes()) > 0 {
+        return false;
+      }
+    }
+    None => {}
+  }
+  return true;
+}
+
+fn message_of(line: &Bytes) -> Option<String>
+  intent "Read the msg field of a stored log record."
+  requires none
+  ensures none
+  effects none
+{
+  let parsed = json.parse(&line).ok()?;
+  let nodes = parsed.nodes();
+  match nodes.get(parsed.root()) {
+    Some(JsonNode.Object(fields)) => {
+      let mut i = 0;
+      while i < fields.len() {
+        match fields.get(i) {
+          Some(item) => {
+            if item.name() == "msg" {
+              return match nodes.get(item.index()) {
+                Some(JsonNode.Str(text)) => Some(text.clone()),
+                _ => None,
+              };
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    _ => {}
+  }
+  return None;
+}
+
+fn message_matches(line: &Bytes, prefix: &String) -> Bool
+  intent "Check that the msg field starts with the prefix."
+  requires none
+  ensures none
+  effects none
+{
+  let text = match message_of(&line) {
+    Some(found) => found,
+    None => "",
+  };
+  let wanted = prefix.as_bytes();
+  let have = text.as_bytes();
+  if have.byte_len() < wanted.byte_len() {
+    return false;
+  }
+  return compare_bytes(&have.slice(0, wanted.byte_len()).unwrap_or(Bytes.new()), &wanted) == 0;
+}
+
+fn collect_logs(database: &Database, tx: &mut Tx, filter: &LogFilter, limit: Int, scan_limit: Int) -> Result<List<String>, DbError>
+  intent "Walk the newest log headers, filter them and return up to limit records, newest first."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_logs", &None, &None, &ScanOrder.Desc, scan_limit)?;
+  let mut found = List.new();
+  let mut want_hash = Bytes.new();
+  let mut by_component = false;
+  match filter.component {
+    Some(name) => {
+      want_hash = sha256(&name.as_bytes());
+      by_component = true;
+    }
+    None => {}
+  }
+  let mut i = 0;
+  while i < rows.len() && found.len() < limit {
+    match rows.get(i) {
+      Some(row) => {
+        let mut keep = in_range(&row_text(&row, 1), &filter.since, &filter.until);
+        if keep && by_component {
+          keep = compare_bytes(&row_bytes(&row, 2), &want_hash) == 0;
+        }
+        match filter.level {
+          Some(level) => {
+            if row_text(&row, 3) != level {
+              keep = false;
+            }
+          }
+          None => {}
+        }
+        if keep {
+          let data = read_payload(&database, &mut tx, &Value.IntVal(row_int(&row, 0)), row_int(&row, 4))?;
+          let mut line = data;
+          if line.byte_len() > 0 && line.get(line.byte_len() - 1).unwrap_or(0) == 10 {
+            line = line.slice(0, line.byte_len() - 1).unwrap_or(Bytes.new());
+          }
+          let mut matched = true;
+          match filter.prefix {
+            Some(prefix) => {
+              matched = message_matches(&line, &prefix);
+            }
+            None => {}
+          }
+          if matched {
+            found.push(line.to_string_utf8().map_err(|error| DbError.Corrupt("stored log is not UTF-8"))?);
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(found);
+}
+
+pub fn recent_logs(database: &mut Database, filter: &LogFilter, limit: Int, scan_limit: Int) -> Result<List<String>, DbError>
+  intent "Search the most recent scan_limit log records and return at most limit matches, newest first."
+  requires none
+  ensures none
+  effects fs
+{
+  if limit < 0 || scan_limit < 0 {
+    return Err(DbError.Limit("negative query limit"));
+  }
+  let mut tx = begin_tx(&mut database)?;
+  let found = collect_logs(&database, &mut tx, &filter, limit, scan_limit);
+  let _ = tx_rollback(&mut tx, &mut database);
+  return found;
+}
+
+fn sample_value(line: &Bytes, name: &String) -> Option<Float>
+  intent "The numeric value of a stored sample when its metric name matches."
+  requires none
+  ensures none
+  effects none
+{
+  let parsed = json.parse(&line).ok()?;
+  let nodes = parsed.nodes();
+  let mut matched = false;
+  let mut number = None;
+  match nodes.get(parsed.root()) {
+    Some(JsonNode.Object(fields)) => {
+      let mut i = 0;
+      while i < fields.len() {
+        match fields.get(i) {
+          Some(item) => {
+            if item.name() == "name" {
+              match nodes.get(item.index()) {
+                Some(JsonNode.Str(text)) => {
+                  matched = text == name;
+                }
+                _ => {}
+              }
+            }
+            if item.name() == "value" {
+              match nodes.get(item.index()) {
+                Some(JsonNode.Int(whole)) => {
+                  number = Some(to_float(whole + 0));
+                }
+                Some(JsonNode.Float(real)) => {
+                  number = Some(real + 0.0);
+                }
+                _ => {}
+              }
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+    }
+    _ => {}
+  }
+  if !matched {
+    return None;
+  }
+  return number;
+}
+
+fn collect_summary(database: &Database, tx: &mut Tx, component: &String, name: &String, since: &Option<String>, until: &Option<String>, scan_limit: Int) -> Result<MetricSummary, DbError>
+  intent "Aggregate matching metric samples among at most scan_limit stored rows."
+  requires none
+  ensures none
+  effects fs
+{
+  let rows = rel_scan(&database, &mut tx, &"argus_metrics", &None, &None, &ScanOrder.Asc, scan_limit + 1)?;
+  let want_hash = sha256(&component.as_bytes());
+  let mut summary = MetricSummary { samples: 0, sum: 0.0, min: 0.0, max: 0.0, last: 0.0, last_ts: "", scanned: 0, complete: rows.len() <= scan_limit };
+  let mut i = 0;
+  while i < rows.len() && i < scan_limit {
+    match rows.get(i) {
+      Some(row) => {
+        summary.scanned = summary.scanned + 1;
+        let ts = row_text(&row, 1);
+        if compare_bytes(&row_bytes(&row, 2), &want_hash) == 0 && in_range(&ts, &since, &until) {
+          let key = Value.BytesVal(row_bytes(&row, 0));
+          let data = read_payload(&database, &mut tx, &key, row_int(&row, 4))?;
+          match sample_value(&data, &name) {
+            Some(number) => {
+              if summary.samples == 0 {
+                summary.min = number;
+                summary.max = number;
+              }
+              if number < summary.min {
+                summary.min = number;
+              }
+              if number > summary.max {
+                summary.max = number;
+              }
+              summary.sum = summary.sum + number;
+              if summary.samples == 0 || compare_bytes(&ts.as_bytes(), &summary.last_ts.as_bytes()) >= 0 {
+                summary.last = number;
+                summary.last_ts = ts.clone();
+              }
+              summary.samples = summary.samples + 1;
+            }
+            None => {}
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Ok(summary);
+}
+
+pub fn metric_summary(database: &mut Database, component: &String, name: &String, since: &Option<String>, until: &Option<String>, scan_limit: Int) -> Result<MetricSummary, DbError>
+  intent "Count, sum, min, max and the latest value of one component's metric over a time range."
+  requires none
+  ensures none
+  effects fs
+{
+  if scan_limit < 0 {
+    return Err(DbError.Limit("negative query limit"));
+  }
+  let mut tx = begin_tx(&mut database)?;
+  let found = collect_summary(&database, &mut tx, &component, &name, &since, &until, scan_limit);
+  let _ = tx_rollback(&mut tx, &mut database);
+  return found;
+}

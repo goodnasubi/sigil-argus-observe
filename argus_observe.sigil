@@ -365,6 +365,15 @@ pub fn log_line(ts: &String, component: &String, level: Level, msg: &String, con
   ensures none
   effects none
 {
+  return encode_log(&ts, &component, level, &msg, &context, false);
+}
+
+fn encode_log(ts: &String, component: &String, level: Level, msg: &String, context: &LogContext, already_truncated: Bool) -> Result<Line, ObserveError>
+  intent "Encode one log line; already_truncated keeps the marker of a record that a producer had shortened."
+  requires none
+  ensures none
+  effects none
+{
   if !valid_timestamp(&ts) {
     return Err(ObserveError.InvalidTimestamp);
   }
@@ -404,7 +413,7 @@ pub fn log_line(ts: &String, component: &String, level: Level, msg: &String, con
   }
   let input = msg.as_bytes();
   let mut prefix = message_prefix(&input, budget);
-  if prefix.byte_len() < input.byte_len() {
+  if already_truncated || prefix.byte_len() < input.byte_len() {
     if budget < truncated.byte_len() {
       return Err(ObserveError.LogTooLarge);
     }
@@ -656,8 +665,8 @@ impl Metric {
   }
 }
 
-fn metric_line(metric: &Metric, ts: &String, name: String, kind: String, value: JsonNode, bound: Option<String>) -> Result<Line, ObserveError>
-  intent "Encode one sample with the normalized labels."
+fn sample_line(ts: &String, component: &String, labels: &List<Label>, name: String, kind: String, value: JsonNode, bound: Option<String>) -> Result<Line, ObserveError>
+  intent "Encode one sample with the given normalized labels."
   requires none
   ensures none
   effects none
@@ -665,14 +674,14 @@ fn metric_line(metric: &Metric, ts: &String, name: String, kind: String, value: 
   let mut nodes = List.new();
   let mut members = List.new();
   add_member(&mut nodes, &mut members, "ts", JsonNode.Str(ts.clone()));
-  add_member(&mut nodes, &mut members, "component", JsonNode.Str(metric.component.clone()));
+  add_member(&mut nodes, &mut members, "component", JsonNode.Str(component.clone()));
   add_member(&mut nodes, &mut members, "name", JsonNode.Str(name));
   add_member(&mut nodes, &mut members, "type", JsonNode.Str(kind));
   add_member(&mut nodes, &mut members, "value", value);
   let mut label_fields = List.new();
   let mut i = 0;
-  while i < metric.labels.len() {
-    match metric.labels.get(i) {
+  while i < labels.len() {
+    match labels.get(i) {
       Some(entry) => {
         add_member(&mut nodes, &mut label_fields, entry.key.clone(), JsonNode.Str(entry.value.clone()));
       }
@@ -685,7 +694,20 @@ fn metric_line(metric: &Metric, ts: &String, name: String, kind: String, value: 
   let root = nodes.len();
   nodes.push(JsonNode.Object(members));
   let encoded = json_bytes(&JsonValue.new(nodes, root))?;
+  // The component is copied into the labels, so the canonical record can be larger than what was received.
+  if encoded.byte_len() + 1 > 65536 {
+    return Err(ObserveError.LogTooLarge);
+  }
   return Ok(Line { json_text: utf8(&encoded)? });
+}
+
+fn metric_line(metric: &Metric, ts: &String, name: String, kind: String, value: JsonNode, bound: Option<String>) -> Result<Line, ObserveError>
+  intent "Encode one sample with the normalized labels."
+  requires none
+  ensures none
+  effects none
+{
+  return sample_line(&ts, &metric.component, &metric.labels, name, kind, value, bound);
 }
 
 fn suffixed(name: &String, suffix: &String) -> Result<String, ObserveError>
@@ -740,4 +762,231 @@ impl Metric {
     }
     return Ok(lines);
   }
+}
+
+fn member_index(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Option<Int>
+  intent "Find the node index of one member of a parsed object."
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < fields.len() {
+    match fields.get(i) {
+      Some(item) => {
+        if item.name() == name {
+          return Some(item.index());
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+fn member_text(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<Option<String>, ObserveError>
+  intent "Read an optional string member; a member of another type is invalid."
+  requires none
+  ensures none
+  effects none
+{
+  return match member_index(&nodes, &fields, &name) {
+    None => Ok(None),
+    Some(index) => match nodes.get(index) {
+      Some(JsonNode.Str(value)) => Ok(Some(value.clone())),
+      _ => Err(ObserveError.InvalidJson),
+    },
+  };
+}
+
+fn required_text(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<String, ObserveError>
+  intent "Read a required string member."
+  requires none
+  ensures none
+  effects none
+{
+  return match member_text(&nodes, &fields, &name)? {
+    Some(value) => Ok(value),
+    None => Err(ObserveError.InvalidJson),
+  };
+}
+
+fn member_flag(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<Bool, ObserveError>
+  intent "Read an optional boolean member; a member of another type is invalid."
+  requires none
+  ensures none
+  effects none
+{
+  return match member_index(&nodes, &fields, &name) {
+    None => Ok(false),
+    Some(index) => match nodes.get(index) {
+      Some(JsonNode.Bool(flag)) => Ok(flag),
+      _ => Err(ObserveError.InvalidJson),
+    },
+  };
+}
+
+fn member_object(nodes: &List<JsonNode>, fields: &List<JsonField>, name: &String) -> Result<Option<JsonValue>, ObserveError>
+  intent "Read an optional object member as a standalone JSON value."
+  requires none
+  ensures none
+  effects none
+{
+  return match member_index(&nodes, &fields, &name) {
+    None => Ok(None),
+    Some(index) => match nodes.get(index) {
+      Some(JsonNode.Object(_)) => Ok(Some(JsonValue.new(nodes.clone(), index))),
+      _ => Err(ObserveError.InvalidJson),
+    },
+  };
+}
+
+fn level_from_name(name: &String) -> Result<Level, ObserveError>
+  intent "Parse an upper-case ADR log level."
+  requires none
+  ensures none
+  effects none
+{
+  if name == "DEBUG" {
+    return Ok(Level.Debug);
+  }
+  if name == "INFO" {
+    return Ok(Level.Info);
+  }
+  if name == "WARN" {
+    return Ok(Level.Warn);
+  }
+  if name == "ERROR" {
+    return Ok(Level.Error);
+  }
+  if name == "FATAL" {
+    return Ok(Level.Fatal);
+  }
+  return Err(ObserveError.InvalidJson);
+}
+
+fn accept_log(nodes: &List<JsonNode>, fields: &List<JsonField>, ts: &String, component: &String) -> Result<Line, ObserveError>
+  intent "Rebuild a received log record through the emitter so it is validated and bounded."
+  requires none
+  ensures none
+  effects none
+{
+  let level = level_from_name(&required_text(&nodes, &fields, &"level")?)?;
+  let msg = required_text(&nodes, &fields, &"msg")?;
+  let trace_id = member_text(&nodes, &fields, &"trace_id")?;
+  let span_id = member_text(&nodes, &fields, &"span_id")?;
+  let target = member_text(&nodes, &fields, &"target")?;
+  let err = member_object(&nodes, &fields, &"err")?;
+  let extra = member_object(&nodes, &fields, &"fields")?;
+  let already_truncated = member_flag(&nodes, &fields, &"truncated")?;
+  return encode_log(&ts, &component, level, &msg, &log_context(trace_id, span_id, target, err, extra), already_truncated);
+}
+
+fn metric_value(nodes: &List<JsonNode>, fields: &List<JsonField>) -> Result<JsonNode, ObserveError>
+  intent "Read the finite numeric sample value."
+  requires none
+  ensures none
+  effects none
+{
+  let index = member_index(&nodes, &fields, &"value").ok_or(ObserveError.InvalidNumber)?;
+  match nodes.get(index) {
+    Some(JsonNode.Int(number)) => {
+      return Ok(JsonNode.Int(number + 0));
+    }
+    Some(JsonNode.Float(number)) => {
+      if !finite(number + 0.0) {
+        return Err(ObserveError.InvalidNumber);
+      }
+      return Ok(JsonNode.Float(number + 0.0));
+    }
+    _ => {
+      return Err(ObserveError.InvalidNumber);
+    }
+  }
+}
+
+fn accept_metric(nodes: &List<JsonNode>, fields: &List<JsonField>, ts: &String, component: &String, label_fields: &List<JsonField>) -> Result<Line, ObserveError>
+  intent "Validate a received metric sample and normalize its component label."
+  requires none
+  ensures none
+  effects none
+{
+  let name = required_text(&nodes, &fields, &"name")?;
+  if !valid_metric_name(&name) {
+    return Err(ObserveError.InvalidMetricName);
+  }
+  let kind = required_text(&nodes, &fields, &"type")?;
+  if kind != "counter" && kind != "gauge" && kind != "histogram" {
+    return Err(ObserveError.InvalidJson);
+  }
+  let value = metric_value(&nodes, &fields)?;
+  let mut labels = List.new();
+  labels.push(label("component", component.clone()));
+  let mut i = 0;
+  while i < label_fields.len() {
+    match label_fields.get(i) {
+      Some(item) => {
+        let key = item.name();
+        let text = match nodes.get(item.index()) {
+          Some(JsonNode.Str(piece)) => Ok(piece.clone()),
+          _ => Err(ObserveError.InvalidLabels),
+        }?;
+        if key != "component" {
+          let mut j = 1;
+          while j < labels.len() {
+            match labels.get(j) {
+              Some(existing) => {
+                if existing.key == key {
+                  return Err(ObserveError.InvalidLabels);
+                }
+              }
+              None => {}
+            }
+            j = j + 1;
+          }
+          if labels.len() >= 10 {
+            return Err(ObserveError.InvalidLabels);
+          }
+          labels.push(label(key, text));
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return sample_line(&ts, &component, &labels, name, kind, value, None);
+}
+
+pub fn accept_line(text: &String) -> Result<Line, ObserveError>
+  intent "Validate one received NDJSON record (log or metric) and return its canonical emitter form."
+  requires none
+  ensures none
+  effects none
+{
+  let data = text.as_bytes();
+  if data.byte_len() + 1 > 65536 {
+    return Err(ObserveError.LogTooLarge);
+  }
+  let parsed = json.parse(&data).map_err(|error| ObserveError.InvalidJson)?;
+  let nodes = parsed.nodes();
+  let fields = match nodes.get(parsed.root()) {
+    Some(JsonNode.Object(items)) => Ok(items.clone()),
+    _ => Err(ObserveError.InvalidJson),
+  }?;
+  let ts = required_text(&nodes, &fields, &"ts")?;
+  if !valid_timestamp(&ts) {
+    return Err(ObserveError.InvalidTimestamp);
+  }
+  let component = required_text(&nodes, &fields, &"component")?;
+  if !valid_component(&component) {
+    return Err(ObserveError.InvalidComponent);
+  }
+  return match member_index(&nodes, &fields, &"labels") {
+    Some(index) => match nodes.get(index) {
+      Some(JsonNode.Object(label_fields)) => accept_metric(&nodes, &fields, &ts, &component, &label_fields),
+      _ => Err(ObserveError.InvalidLabels),
+    },
+    None => accept_log(&nodes, &fields, &ts, &component),
+  };
 }
