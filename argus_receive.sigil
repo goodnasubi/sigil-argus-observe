@@ -618,13 +618,11 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     }
   }
 
-  let mut added_bytes = 0;
   let mut pending = batch(lines.len() * 65536 + 1)?;
   let mut i = 0;
   while i < lines.len() {
     match lines.get(i) {
       Some(line) => {
-        added_bytes = added_bytes + line.ndjson().byte_len();
         pending.append(&line)?;
       }
       None => {}
@@ -632,18 +630,34 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     i = i + 1;
   }
 
-  // Capacity FIFO rotation: discard oldest logs and metrics when stored_bytes + added_bytes exceeds max_disk_bytes
-  if config.max_disk_bytes > 0 && inner.stored_bytes + added_bytes > config.max_disk_bytes {
-    let excess = inner.stored_bytes + added_bytes - config.max_disk_bytes;
-    let mut tx = begin_tx(&mut inner.database)?;
+  // Calculate new bytes to be stored, excluding duplicate metric samples
+  let mut cap_tx = begin_tx(&mut inner.database)?;
+  let net_bytes = pending.net_new_bytes(&inner.database, &mut cap_tx)?;
+
+  // If incoming batch alone exceeds max_disk_bytes, reject immediately without pruning
+  if config.max_disk_bytes > 0 && net_bytes > config.max_disk_bytes {
+    let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+    pending.clear();
+    return Err(DbError.Limit("capacity_exceeded"));
+  }
+
+  // Capacity FIFO rotation: discard oldest logs and metrics when stored_bytes + net_bytes exceeds max_disk_bytes
+  if config.max_disk_bytes > 0 && inner.stored_bytes + net_bytes > config.max_disk_bytes {
+    let excess = inner.stored_bytes + net_bytes - config.max_disk_bytes;
     let mut freed = 0;
-    let freed_logs = prune_oldest_logs(&inner.database, &mut tx, excess).unwrap_or(0);
+    let freed_logs = prune_oldest_logs(&inner.database, &mut cap_tx, excess).unwrap_or(0);
     freed = freed + freed_logs;
     if freed < excess {
-      let freed_metrics = prune_oldest_metrics(&inner.database, &mut tx, excess - freed).unwrap_or(0);
+      let freed_metrics = prune_oldest_metrics(&inner.database, &mut cap_tx, excess - freed).unwrap_or(0);
       freed = freed + freed_metrics;
     }
-    match tx_commit(&mut tx, &mut inner.database) {
+    // If capacity cannot be reclaimed to accommodate new records, rollback pruning and reject
+    if inner.stored_bytes - freed + net_bytes > config.max_disk_bytes {
+      let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+      pending.clear();
+      return Err(DbError.Limit("capacity_exceeded"));
+    }
+    match tx_commit(&mut cap_tx, &mut inner.database) {
       Ok(_) => {
         if freed > inner.stored_bytes {
           inner.stored_bytes = 0;
@@ -652,14 +666,13 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
         }
       }
       Err(_) => {
-        let _ = tx_rollback(&mut tx, &mut inner.database);
+        let _ = tx_rollback(&mut cap_tx, &mut inner.database);
+        pending.clear();
+        return Err(DbError.Limit("capacity_exceeded"));
       }
     }
-    // If capacity cannot be reclaimed to accommodate new records, reject ingestion
-    if inner.stored_bytes + added_bytes > config.max_disk_bytes {
-      pending.clear();
-      return Err(DbError.Limit("capacity_exceeded"));
-    }
+  } else {
+    let _ = tx_rollback(&mut cap_tx, &mut inner.database);
   }
 
   let mut accepted = 0;
@@ -667,7 +680,7 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
   match pending.flush(&mut inner.database) {
     Ok(count) => {
       accepted = count;
-      inner.stored_bytes = inner.stored_bytes + added_bytes;
+      inner.stored_bytes = inner.stored_bytes + net_bytes;
     }
     Err(error) => {
       if !is_duplicate_key(&error) {
