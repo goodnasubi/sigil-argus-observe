@@ -630,9 +630,10 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
     i = i + 1;
   }
 
-  // Calculate new bytes to be stored, excluding duplicate metric samples
+  // Filter out duplicate metrics already in database or earlier in the batch
   let mut cap_tx = begin_tx(&mut inner.database)?;
-  let net_bytes = pending.net_new_bytes(&inner.database, &mut cap_tx)?;
+  let duplicate_count = pending.drop_existing_metrics(&inner.database, &mut cap_tx)?;
+  let net_bytes = pending.byte_size();
 
   // If incoming batch alone exceeds max_disk_bytes, reject immediately without pruning
   if config.max_disk_bytes > 0 && net_bytes > config.max_disk_bytes {
@@ -676,39 +677,18 @@ fn store_lines(inner: &mut State, config: &ReceiverConfig, lines: &List<Line>, o
   }
 
   let mut accepted = 0;
-  let mut duplicates = 0;
+  let mut duplicates = duplicate_count;
   match pending.flush(&mut inner.database) {
     Ok(count) => {
       accepted = count;
       inner.stored_bytes = inner.stored_bytes + net_bytes;
     }
     Err(error) => {
-      if !is_duplicate_key(&error) {
-        pending.clear();
-        return Err(error);
-      }
       pending.clear();
-      let mut j = 0;
-      while j < lines.len() {
-        match lines.get(j) {
-          Some(line) => {
-            match store_one(&mut inner, &line) {
-              Ok(done) => {
-                accepted = accepted + 1;
-                inner.stored_bytes = inner.stored_bytes + line.ndjson().byte_len();
-              }
-              Err(single_error) => {
-                if is_duplicate_key(&single_error) {
-                  duplicates = duplicates + 1;
-                } else {
-                  return Err(single_error);
-                }
-              }
-            }
-          }
-          None => {}
-        }
-        j = j + 1;
+      if is_duplicate_key(&error) {
+        duplicates = duplicates + 1;
+      } else {
+        return Err(error);
       }
     }
   }
